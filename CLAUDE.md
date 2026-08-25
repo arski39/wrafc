@@ -19,16 +19,113 @@ Two components:
 > OpenFrontIO. Do not resurrect it. It is recoverable from git commit `d5c610a` if
 > ever needed.
 
-## ⛔ BLOCKER before any on-chain verification
-**WSL toolchain install + `anchor build && anchor test` must pass, including the three
-new `cancel_match` tests. No wager flow may be tested end-to-end until this completes.**
+## Toolchain — WSL setup that actually works
 
-The Rust/Solana/Anchor toolchain is **not installed** on this machine (no `rustc`,
-`cargo`, `rustup`, `solana`, `anchor`, `avm`; WSL has no distro). Until that is fixed:
-- The Anchor program has **never been compiled** — there is no `target/` directory, so
-  `tests/arena.ts`'s `import type { Arena } from "../target/types/arena"` cannot resolve.
-- The `cancel_match` port and its tests (below) are **written but unverified**.
-- TypeScript work proceeds gated on `tsc --noEmit` only.
+The Solana/Anchor toolchain does not run natively on Windows here; everything below
+runs inside WSL. **This exact combination is what built successfully — do not
+downgrade any part of it** (see "Why these versions" below).
+
+| Component | Version |
+|---|---|
+| WSL distro | Ubuntu (WSL2) |
+| Host Rust | stable (1.98.0 at time of setup) |
+| Solana CLI | Agave 4.2.1 (`cargo-build-sbf` 4.1.0, platform-tools **v1.54**) |
+| Anchor CLI | 0.31.1 (via `avm`) |
+| Node (in WSL) | 20.x + yarn |
+
+One-time setup, from an elevated PowerShell then inside WSL:
+
+```powershell
+wsl --install -d Ubuntu --no-launch     # WSL2 + Ubuntu, no interactive account prompt
+```
+
+```bash
+# --- run as root inside: wsl -d Ubuntu -u root ---
+apt-get update
+apt-get install -y build-essential pkg-config libssl-dev libudev-dev zlib1g-dev \
+    llvm clang cmake make libprotobuf-dev protobuf-compiler curl git bzip2 ca-certificates
+
+# Host Rust (stable; must support edition2024)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+export PATH="$HOME/.cargo/bin:$PATH"
+
+# Solana CLI - use the *stable* channel, not a pinned 1.18/2.1 (see below)
+sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
+
+# Node + yarn (Anchor.toml's test script shells out to yarn)
+curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+apt-get install -y nodejs
+npm install -g yarn
+
+# Anchor via avm
+cargo install --git https://github.com/coral-xyz/anchor avm --tag v0.31.1 --locked --force
+export PATH="$HOME/.avm/bin:$PATH"
+avm install 0.31.1 && avm use 0.31.1
+
+# Anchor.toml points provider.wallet at this; create it once
+solana-keygen new --no-bip39-passphrase -o ~/.config/solana/id.json
+```
+
+Build and test (note the project path contains spaces — always quote it):
+
+```bash
+cd "/mnt/c/Users/Aaro Eskelinen/SOLANA WAGER konsepti"
+anchor build
+anchor test --skip-local-validator   # tests use bankrun in-process; no validator needed
+```
+
+`npm install` for the root test deps **must be run from inside WSL** — `solana-bankrun`
+is a native NAPI module and the Windows binaries will not load under Linux.
+
+### Why these versions (do not "simplify" this)
+The original pairing (Anchor 0.30.1 + Solana 1.18.26 + Rust 1.79) **cannot build this
+project today**, and a lot of time was burned discovering why:
+
+1. With no `Cargo.lock` committed, Cargo resolved every transitive dep to its newest
+   release. Dozens of those adopted **edition2024** during 2025, which Rust 1.79 cannot
+   parse. Pinning them back one at a time does not converge — `blake3` → `digest` →
+   `block-buffer`, then `proc-macro-crate` → `toml_edit` → `toml_datetime`, then
+   `getrandom`, and so on.
+2. Upgrading only the *host* Rust does not help: `cargo-build-sbf` uses the Rust bundled
+   in **platform-tools**, and both Solana 1.18.26 (v1.43) and Agave 2.1.21 ship Rust
+   1.79. Only platform-tools **v1.54** (Agave 4.x) is new enough.
+3. Anchor 0.30.1 additionally cannot generate an IDL on a modern registry at all — its
+   `anchor-syn` calls `proc_macro2::Span::source_file()`, an API since removed. The IDL
+   build re-resolves under a separate cargo, so lockfile pins do not reach it. Anchor
+   **0.31.1** fixes this.
+
+A `Cargo.lock` is now committed. Keep it committed.
+
+## Status of on-chain verification — ✅ GREEN
+- `anchor build` passes. Produces `target/deploy/arena.so`, `target/idl/arena.json`
+  (all four instructions incl. `cancel_match`, 10 errors), `target/types/arena.ts`.
+- `anchor test --skip-deploy --skip-local-validator` — **7 passing, 0 failing.**
+  Happy path, rake math, double-join rejected, bad-signature rejected, plus the three
+  `cancel_match` tests (refund, non-authority rejected, already-started rejected).
+
+Use `--skip-deploy --skip-local-validator`. Plain `anchor test` fails: `--skip-local-validator`
+alone still tries to *deploy* to `127.0.0.1:8899`, and these tests need no validator —
+bankrun runs an in-process SVM and loads `target/deploy/arena.so` directly.
+
+### Test-suite gotchas (all cost real debugging time — don't reintroduce)
+- **Never use `@solana/spl-token`'s action helpers** (`createMint`, `mintTo`,
+  `createAssociatedTokenAccount`, `getAccount`) in these tests. They call
+  `connection.sendTransaction`, and `BankrunProvider.connection` is a BanksClient shim,
+  not a real `Connection`. Use the instruction builders plus the local `sendTx()` /
+  `getTokenAccount()` helpers.
+- **`settle_match` takes no `.signers([...])`.** It declares no `Signer` account — the
+  server authorises via the ed25519 prelude instruction. Passing the server key there
+  fails with `unknown signer`.
+- **bankrun reuses one blockhash**, so re-sending an identical transaction is rejected
+  as "already processed" before the program runs. The double-join test therefore
+  resubmits with a different fee payer to make the transaction distinct.
+- **Raw `banksClient` submissions bypass Anchor's error translation**, surfacing
+  `custom program error: 0x…` instead of the variant name. `ArenaError` numbering starts
+  at 6000 in declaration order (e.g. `AlreadyJoined` = 6003 = `0x1773`).
+- `anchor-bankrun` 0.5.0 (its newest) declares a peer of `@coral-xyz/anchor@^0.30.0`
+  while the program is on 0.31.1, so root installs need `npm install --legacy-peer-deps`.
+  `BankrunProvider`'s API is unchanged across that gap.
 
 ## Hard Rules
 - All wager logic lives in the Anchor program. **The server never holds user funds.**
@@ -69,6 +166,30 @@ validation against the per-turn state hashes already exchanged for desync detect
 (`GameServer.ts`). **Do not widen wagered matches to large public lobbies, or raise
 stake limits, without revisiting this.**
 
+## Deviation — Anchor upgraded 0.30.1 → 0.31.1
+The plan assumed the program stayed on `anchor-lang` 0.30.1. It could not: 0.30.1's IDL
+generator is broken against any current crate registry (reason 3 above), and the IDL is
+required by `tests/arena.ts`. `programs/arena/Cargo.toml` now targets `anchor-lang` /
+`anchor-spl` **0.31.1**, and the root `package.json` was bumped to `@coral-xyz/anchor`
+**^0.31.1** so the TS client matches the 0.31 IDL format. `@solana/spl-token` and
+`tweetnacl` were also added there — `tests/arena.ts` imports both but neither was
+declared.
+
+## Five pre-existing bugs the first compile exposed
+The program had never been built, so none of these had ever surfaced. All are fixed:
+1. `Cargo.toml` — `anchor-spl` feature was `associated-token`; the real name is
+   `associated_token`. Dependency resolution failed outright.
+2. `settle_match.rs` — `#[account(address = sysvar::instructions::ID)]` referenced an
+   unimported `sysvar`; only the `ix_sysvar` alias is in scope.
+3. `instructions/mod.rs` — re-exported only the Accounts structs, so the
+   `__client_accounts_*` modules generated by `#[derive(Accounts)]` never reached the
+   crate root where `#[program]` looks for them. Now uses glob re-exports.
+4. `settle_match.rs` — six `E0502` borrow errors: `&mut match_account` was held across
+   the CPI calls that need it borrowed immutably. Values are copied up front and the
+   mutation deferred to the end.
+5. `Cargo.toml` — missing the `[features]` block, including `idl-build`, which Anchor
+   0.30+ requires.
+
 ## Deviation from the original plan — `cancel_match` port
 The approved plan said to leave `programs/arena/` unmodified. That was based on a stale
 assumption, and we deviated deliberately. Reason:
@@ -98,11 +219,11 @@ which is what it must now match.
 ## Current State
 - **Anchor program** (`programs/arena/`): all four instructions implemented —
   `create_match` (vault is a real PDA-owned ATA), `join_match`, `settle_match`
-  (on-chain ed25519 verified), `cancel_match` (ported, hardened). **Never compiled** —
-  see BLOCKER.
-- **Tests** (`tests/arena.ts`): happy path, rake math, double-join rejected, bad
-  signature rejected, plus three new `cancel_match` tests (refund happy path,
-  non-authority rejected, already-started rejected). **Never run** — see BLOCKER.
+  (on-chain ed25519 verified), `cancel_match` (ported, hardened). **Compiles** under the
+  toolchain above; `arena.so` + IDL + types are generated.
+- **Tests** (`tests/arena.ts`): 7 tests, all passing — happy path, rake math,
+  double-join rejected, bad signature rejected, and three `cancel_match` tests (refund
+  happy path, non-authority rejected, already-started rejected).
 - **OpenFrontIO wager integration**: partially built, largely unwired. Working:
   `arena/auth.ts` + `client/arena/walletAuth.ts` (SIWS-style wallet signature),
   `matchRegistry`, `walletRegistry`, and the wagered-join gate in `Worker.ts`.
@@ -145,8 +266,11 @@ Each stage is gated on `npx tsc --noEmit` (from `OpenFrontIO/`) before moving on
   `// [ARENA]` comment — see `OpenFrontIO/docs/upstream-map.md`. This keeps upstream
   merges tractable.
 - Checks before declaring done:
-  - Program: `anchor build && anchor test` (blocked — see BLOCKER)
+  - Program: from WSL, `anchor build && anchor test --skip-local-validator`
   - Game: from `OpenFrontIO/`, `npx tsc --noEmit` and `npm run lint`
+  - Current `OpenFrontIO` tsc baseline is **2 pre-existing errors**
+    (`arena/settler.ts` possibly-undefined, `GameServer.ts` null-assignability). Both
+    are fixed by Stage 5. Any count above 2 means you introduced something.
 - The `run-openfront` skill in `OpenFrontIO/.claude/skills/` is written for headless
   Ubuntu + Playwright and does not apply directly on this Windows machine. Use the
   human path: `npm run dev`, then open `http://localhost:9000`.

@@ -1,13 +1,26 @@
-import * as anchor from "@coral-xyz/anchor";
+﻿import * as anchor from "@coral-xyz/anchor";
 import { Program, BN } from "@coral-xyz/anchor";
-import { PublicKey, Keypair, SystemProgram, SYSVAR_RENT_PUBKEY } from "@solana/web3.js";
 import {
-  createMint,
-  createAssociatedTokenAccount,
-  mintTo,
-  getAccount,
+  PublicKey,
+  Keypair,
+  SystemProgram,
+  SYSVAR_RENT_PUBKEY,
+  Transaction,
+  TransactionInstruction,
+} from "@solana/web3.js";
+// NOTE: the high-level spl-token action helpers (createMint, mintTo, ...) cannot be
+// used here. They call connection.sendTransaction, and BankrunProvider's `connection`
+// is a BanksClient shim, not a real web3.js Connection. Use the instruction builders
+// and push them through banksClient instead.
+import {
+  MINT_SIZE,
   TOKEN_PROGRAM_ID,
   ASSOCIATED_TOKEN_PROGRAM_ID,
+  createInitializeMint2Instruction,
+  createAssociatedTokenAccountInstruction,
+  createMintToInstruction,
+  getAssociatedTokenAddressSync,
+  unpackAccount,
 } from "@solana/spl-token";
 import { BankrunProvider, startAnchor } from "anchor-bankrun";
 import { ProgramTestContext } from "solana-bankrun";
@@ -99,29 +112,72 @@ describe("arena", () => {
     anchor.setProvider(provider);
     program = anchor.workspace.Arena as Program<Arena>;
 
-    // Create mint (authority = server)
-    const serverAnchorKp = Keypair.fromSecretKey(
-      // fromSecretKey expects 64-byte Solana keypair; nacl gives us 64-byte (seed||pub) format
-      Buffer.from(serverKp.secretKey),
-    );
-    mint = await createMint(provider.connection, serverAnchorKp, serverPubkey, null, 0);
+    // fromSecretKey expects a 64-byte Solana keypair; nacl gives us the same
+    // 64-byte (seed || pubkey) layout.
+    const serverAnchorKp = Keypair.fromSecretKey(Buffer.from(serverKp.secretKey));
 
+    const mintKp = Keypair.generate();
+    mint = mintKp.publicKey;
     treasury = Keypair.generate();
-    // Fund treasury for rent
-    await context.banksClient; // no-op, just ensuring context is live
-    treasuryAta = await createAssociatedTokenAccount(
-      provider.connection,
-      serverAnchorKp,
-      mint,
-      treasury.publicKey,
-    );
 
-    // Mint tokens to players
-    const p1Ata = await createAssociatedTokenAccount(provider.connection, serverAnchorKp, mint, player1Kp.publicKey);
-    const p2Ata = await createAssociatedTokenAccount(provider.connection, serverAnchorKp, mint, player2Kp.publicKey);
-    await mintTo(provider.connection, serverAnchorKp, mint, p1Ata, serverAnchorKp, 1_000);
-    await mintTo(provider.connection, serverAnchorKp, mint, p2Ata, serverAnchorKp, 1_000);
+    const rent = await context.banksClient.getRent();
+    const mintLamports = Number(rent.minimumBalance(BigInt(MINT_SIZE)));
+
+    treasuryAta = getAssociatedTokenAddressSync(mint, treasury.publicKey);
+    const p1Ata = getAssociatedTokenAddressSync(mint, player1Kp.publicKey);
+    const p2Ata = getAssociatedTokenAddressSync(mint, player2Kp.publicKey);
+
+    // Mint + ATAs + initial balances, all in one bankrun transaction.
+    await sendTx(
+      [
+        SystemProgram.createAccount({
+          fromPubkey: serverPubkey,
+          newAccountPubkey: mint,
+          space: MINT_SIZE,
+          lamports: mintLamports,
+          programId: TOKEN_PROGRAM_ID,
+        }),
+        createInitializeMint2Instruction(mint, 0, serverPubkey, null),
+        createAssociatedTokenAccountInstruction(serverPubkey, treasuryAta, treasury.publicKey, mint),
+        createAssociatedTokenAccountInstruction(serverPubkey, p1Ata, player1Kp.publicKey, mint),
+        createAssociatedTokenAccountInstruction(serverPubkey, p2Ata, player2Kp.publicKey, mint),
+        createMintToInstruction(mint, p1Ata, serverPubkey, 1_000),
+        createMintToInstruction(mint, p2Ata, serverPubkey, 1_000),
+      ],
+      serverAnchorKp,
+      [serverAnchorKp, mintKp],
+    );
   });
+
+  /** Sign and process a transaction through bankrun's in-process SVM. */
+  async function sendTx(
+    ixs: TransactionInstruction[],
+    payer: Keypair,
+    signers: Keypair[],
+  ): Promise<void> {
+    const tx = new Transaction();
+    tx.recentBlockhash = context.lastBlockhash;
+    tx.feePayer = payer.publicKey;
+    tx.add(...ixs);
+    tx.sign(...signers);
+    await context.banksClient.processTransaction(tx);
+  }
+
+  /** Read and decode an SPL token account via banksClient (not a real Connection). */
+  async function getTokenAccount(address: PublicKey) {
+    const raw = await context.banksClient.getAccount(address);
+    if (!raw) throw new Error(`token account not found: ${address.toBase58()}`);
+    return unpackAccount(
+      address,
+      {
+        lamports: Number(raw.lamports),
+        data: Buffer.from(raw.data),
+        owner: new PublicKey(raw.owner),
+        executable: raw.executable,
+        rentEpoch: Number(raw.rentEpoch ?? 0),
+      } as never,
+    );
+  }
 
   function matchPDA(nonce: bigint): [PublicKey, number] {
     return PublicKey.findProgramAddressSync(
@@ -177,7 +233,6 @@ describe("arena", () => {
   }
 
   async function doSettleMatch(nonce: bigint, winner: PublicKey, scores: bigint[]) {
-    const serverAnchorKp = Keypair.fromSecretKey(Buffer.from(serverKp.secretKey));
     const [match] = matchPDA(nonce);
     const vault = vaultAta(match);
     const winnerAta = await playerAta(winner);
@@ -205,7 +260,9 @@ describe("arena", () => {
           data: ed25519Data,
         },
       ])
-      .signers([serverAnchorKp])
+      // No .signers(): settle_match declares no Signer account. The server
+      // authorises via the ed25519 prelude instruction, not a tx signature, so
+      // adding the server key here fails with "unknown signer".
       .rpc();
 
     return { match, winnerAta };
@@ -219,14 +276,14 @@ describe("arena", () => {
 
     const [match] = matchPDA(nonce);
     const vault = vaultAta(match);
-    const vaultBefore = await getAccount(provider.connection, vault);
+    const vaultBefore = await getTokenAccount(vault);
     const pot = Number(vaultBefore.amount);
     assert.equal(pot, Number(ENTRY_FEE) * 2, "vault should hold 2 × entry_fee");
 
     const { winnerAta } = await doSettleMatch(nonce, player1Kp.publicKey, [200n, 100n]);
 
-    const winnerAcct = await getAccount(provider.connection, winnerAta);
-    const treasuryAcct = await getAccount(provider.connection, treasuryAta);
+    const winnerAcct = await getTokenAccount(winnerAta);
+    const treasuryAcct = await getTokenAccount(treasuryAta);
 
     const expectedRake = Math.floor(pot * RAKE_BPS / 10_000);
     const expectedPayout = pot - expectedRake;
@@ -243,10 +300,10 @@ describe("arena", () => {
     await doJoinMatch(nonce, player2Kp);
 
     // Pot = 200 (100 each), rake = 5% = 10
-    const initialTreasury = await getAccount(provider.connection, treasuryAta);
+    const initialTreasury = await getTokenAccount(treasuryAta);
     await doSettleMatch(nonce, player2Kp.publicKey, [80n, 200n]);
 
-    const treasuryAcct = await getAccount(provider.connection, treasuryAta);
+    const treasuryAcct = await getTokenAccount(treasuryAta);
     const earned = Number(treasuryAcct.amount) - Number(initialTreasury.amount);
     assert.equal(earned, 10, "treasury rake should be 10 (5% of 200)");
   });
@@ -256,13 +313,39 @@ describe("arena", () => {
     await doCreateMatch(nonce);
     await doJoinMatch(nonce, player1Kp);
 
+    const [match] = matchPDA(nonce);
+    const vault = vaultAta(match);
+    const pAta = await playerAta(player1Kp.publicKey);
+
+    // Re-sending the *identical* transaction would be rejected as "already
+    // processed" before the program ever runs, because bankrun reuses the same
+    // blockhash. Submitting the same instruction with player1 as fee payer
+    // makes it a distinct transaction, so the program's own AlreadyJoined
+    // check is what rejects it.
+    const ix = await program.methods
+      .joinMatch()
+      .accounts({
+        player: player1Kp.publicKey,
+        matchAccount: match,
+        vault,
+        playerToken: pAta,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .instruction();
+
     let threw = false;
     try {
-      await doJoinMatch(nonce, player1Kp);
+      await sendTx([ix], player1Kp, [player1Kp]);
     } catch (e: unknown) {
       threw = true;
-      const msg = (e as Error).message ?? "";
-      assert.include(msg, "AlreadyJoined", `unexpected error: ${msg}`);
+      const msg = `${(e as Error).message ?? ""} ${JSON.stringify(e)}`;
+      // Submitting through banksClient directly bypasses Anchor's error
+      // translation, so the raw custom program error code surfaces instead of
+      // the variant name. AlreadyJoined is the 4th ArenaError variant, and
+      // Anchor numbers custom errors from 6000: 6000 + 3 = 6003 = 0x1773.
+      const isAlreadyJoined =
+        msg.includes("AlreadyJoined") || msg.includes("0x1773") || msg.includes("6003");
+      assert.isTrue(isAlreadyJoined, `unexpected error: ${msg}`);
     }
     assert.isTrue(threw, "expected AlreadyJoined error");
   });
@@ -276,7 +359,6 @@ describe("arena", () => {
     const [match] = matchPDA(nonce);
     const vault = vaultAta(match);
     const winnerAta = await playerAta(player1Kp.publicKey);
-    const serverAnchorKp = Keypair.fromSecretKey(Buffer.from(serverKp.secretKey));
 
     // Sign wrong message (empty)
     const wrongMsg = Buffer.alloc(32);
@@ -298,7 +380,6 @@ describe("arena", () => {
         .preInstructions([
           { programId: anchor.web3.Ed25519Program.programId, keys: [], data: ed25519Data },
         ])
-        .signers([serverAnchorKp])
         .rpc();
     } catch (e: unknown) {
       threw = true;
@@ -345,18 +426,18 @@ describe("arena", () => {
     await doJoinMatch(nonce, player1Kp);
 
     const p1Ata = await playerAta(player1Kp.publicKey);
-    const before = await getAccount(provider.connection, p1Ata);
+    const before = await getTokenAccount(p1Ata);
 
     const { match, vault } = await doCancelMatch(nonce, [p1Ata]);
 
-    const after = await getAccount(provider.connection, p1Ata);
+    const after = await getTokenAccount(p1Ata);
     assert.equal(
       Number(after.amount) - Number(before.amount),
       Number(ENTRY_FEE),
       "staker should be refunded exactly their stake",
     );
 
-    const vaultAcct = await getAccount(provider.connection, vault);
+    const vaultAcct = await getTokenAccount(vault);
     assert.equal(Number(vaultAcct.amount), 0, "vault should be drained by the refund");
 
     const acct = await program.account.matchAccount.fetch(match);
