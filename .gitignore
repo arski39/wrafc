@@ -1,0 +1,19 @@
+# Nested repository — OpenFrontIO tracks its own history independently.
+OpenFrontIO/
+
+# Dependencies / build output
+node_modules/
+target/
+dist/
+.anchor/
+
+# Analysis artifacts
+graphify-out/
+
+# Secrets — never commit keypairs or environment files
+.env
+.env.*
+!.env.example
+*keypair*.json
+id.json
+*.pem
