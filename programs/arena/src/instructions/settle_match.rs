@@ -25,18 +25,26 @@ pub struct SettleMatch<'info> {
     pub treasury_token: Account<'info, TokenAccount>,
 
     /// CHECK: Solana instructions sysvar
-    #[account(address = sysvar::instructions::ID)]
+    #[account(address = ix_sysvar::ID)]
     pub sysvar_instructions: AccountInfo<'info>,
 
     pub token_program: Program<'info, Token>,
 }
 
 pub fn handler(ctx: Context<SettleMatch>, winner: Pubkey, scores: Vec<u64>) -> Result<()> {
-    let m = &mut ctx.accounts.match_account;
+    // Copy out every value needed up front. Holding a `&mut` to match_account
+    // across the CPI calls below would conflict with the immutable borrows they
+    // need (`to_account_info()`), so the mutable borrow is deferred to the end.
+    let match_key = ctx.accounts.match_account.key();
+    let authority_key = ctx.accounts.match_account.authority;
+    let rake_bps = ctx.accounts.match_account.rake_bps;
+    let nonce_bytes = ctx.accounts.match_account.nonce.to_le_bytes();
+    let bump = ctx.accounts.match_account.bump;
+    let player_count = ctx.accounts.match_account.player_count as usize;
 
     let mut found = false;
-    for i in 0..m.player_count as usize {
-        if m.players[i] == winner {
+    for i in 0..player_count {
+        if ctx.accounts.match_account.players[i] == winner {
             found = true;
             break;
         }
@@ -62,14 +70,14 @@ pub fn handler(ctx: Context<SettleMatch>, winner: Pubkey, scores: Vec<u64>) -> R
 
     let ix_pubkey = Pubkey::try_from(&d[pubkey_off..pubkey_off + 32])
         .map_err(|_| error!(ArenaError::InvalidResultSignature))?;
-    require!(ix_pubkey == m.authority, ArenaError::InvalidResultSignature);
+    require!(ix_pubkey == authority_key, ArenaError::InvalidResultSignature);
 
     let mut scores_bytes: Vec<u8> = Vec::with_capacity(scores.len() * 8);
     for s in &scores {
         scores_bytes.extend_from_slice(&s.to_le_bytes());
     }
     let expected = hashv(&[
-        ctx.accounts.match_account.key().as_ref(),
+        match_key.as_ref(),
         winner.as_ref(),
         &scores_bytes,
     ]);
@@ -79,12 +87,9 @@ pub fn handler(ctx: Context<SettleMatch>, winner: Pubkey, scores: Vec<u64>) -> R
     );
 
     let pot = ctx.accounts.vault.amount;
-    let rake = pot * m.rake_bps as u64 / 10_000;
+    let rake = pot * rake_bps as u64 / 10_000;
     let payout = pot - rake;
 
-    let authority_key = m.authority;
-    let nonce_bytes = m.nonce.to_le_bytes();
-    let bump = m.bump;
     let seeds: &[&[u8]] = &[b"match", authority_key.as_ref(), &nonce_bytes, &[bump]];
     let signer = &[seeds];
 
@@ -116,6 +121,6 @@ pub fn handler(ctx: Context<SettleMatch>, winner: Pubkey, scores: Vec<u64>) -> R
         )?;
     }
 
-    m.status = MatchStatus::Settled;
+    ctx.accounts.match_account.status = MatchStatus::Settled;
     Ok(())
 }

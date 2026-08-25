@@ -25,18 +25,27 @@ pub struct CancelMatch<'info> {
 }
 
 /// Remaining accounts must be the token accounts of each staker in join order.
-pub fn handler(ctx: Context<CancelMatch>) -> Result<()> {
-    let m = &mut ctx.accounts.match_account;
-    let count = m.player_count as usize;
+///
+/// The explicit `'info` binding is required because this handler feeds
+/// `remaining_accounts` into a CPI alongside `ctx.accounts`; without it the two
+/// lifetimes are unrelated and `Account<'info, T>` is invariant over `'info`.
+pub fn handler<'info>(
+    ctx: Context<'_, '_, '_, 'info, CancelMatch<'info>>,
+) -> Result<()> {
+    // Copy the values needed before the CPI loop. Holding a `&mut` to
+    // match_account across the transfers would conflict with the immutable
+    // borrow `to_account_info()` needs, so the mutation is deferred to the end.
+    let count = ctx.accounts.match_account.player_count as usize;
+    let authority_key = ctx.accounts.match_account.authority;
+    let nonce_bytes = ctx.accounts.match_account.nonce.to_le_bytes();
+    let bump = ctx.accounts.match_account.bump;
+    let stakes = ctx.accounts.match_account.stakes;
 
     require!(
         ctx.remaining_accounts.len() >= count,
         ArenaError::FeeMismatch
     );
 
-    let authority_key = m.authority;
-    let nonce_bytes = m.nonce.to_le_bytes();
-    let bump = m.bump;
     let seeds: &[&[u8]] = &[b"match", authority_key.as_ref(), &nonce_bytes, &[bump]];
     let signer = &[seeds];
 
@@ -52,10 +61,10 @@ pub fn handler(ctx: Context<CancelMatch>) -> Result<()> {
                 },
                 signer,
             ),
-            m.stakes[i],
+            stakes[i],
         )?;
     }
 
-    m.status = MatchStatus::Cancelled;
+    ctx.accounts.match_account.status = MatchStatus::Cancelled;
     Ok(())
 }
