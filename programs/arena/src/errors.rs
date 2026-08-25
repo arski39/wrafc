@@ -20,4 +20,6 @@ pub enum ArenaError {
     RakeTooHigh,
     #[msg("Vault account does not match match record")]
     InvalidVault,
+    #[msg("Unauthorized")]
+    Unauthorized,
 }

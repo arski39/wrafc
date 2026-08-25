@@ -307,4 +307,99 @@ describe("arena", () => {
     }
     assert.isTrue(threw, "expected InvalidResultSignature error");
   });
+
+  // --- cancel_match (refund path, ported from the OpenFrontIO program copy) ---
+
+  async function doCancelMatch(
+    nonce: bigint,
+    stakerAtas: PublicKey[],
+    signerKp?: Keypair,
+  ) {
+    const serverAnchorKp = Keypair.fromSecretKey(Buffer.from(serverKp.secretKey));
+    const signer = signerKp ?? serverAnchorKp;
+    const [match] = matchPDA(nonce);
+    const vault = vaultAta(match);
+
+    await program.methods
+      .cancelMatch()
+      .accounts({
+        authority: signer.publicKey,
+        matchAccount: match,
+        vault,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      // Refund targets must be supplied in join order.
+      .remainingAccounts(
+        stakerAtas.map((pubkey) => ({ pubkey, isSigner: false, isWritable: true })),
+      )
+      .signers([signer])
+      .rpc();
+
+    return { match, vault };
+  }
+
+  it("cancel_match refunds every staker and marks the match Cancelled", async () => {
+    const nonce = 14n;
+    await doCreateMatch(nonce);
+    // Join only one player so the match stays Open (MAX_PLAYERS = 2).
+    await doJoinMatch(nonce, player1Kp);
+
+    const p1Ata = await playerAta(player1Kp.publicKey);
+    const before = await getAccount(provider.connection, p1Ata);
+
+    const { match, vault } = await doCancelMatch(nonce, [p1Ata]);
+
+    const after = await getAccount(provider.connection, p1Ata);
+    assert.equal(
+      Number(after.amount) - Number(before.amount),
+      Number(ENTRY_FEE),
+      "staker should be refunded exactly their stake",
+    );
+
+    const vaultAcct = await getAccount(provider.connection, vault);
+    assert.equal(Number(vaultAcct.amount), 0, "vault should be drained by the refund");
+
+    const acct = await program.account.matchAccount.fetch(match);
+    assert.isTrue("cancelled" in acct.status, "match status should be Cancelled");
+  });
+
+  it("cancel_match by a non-authority is rejected with Unauthorized", async () => {
+    const nonce = 15n;
+    await doCreateMatch(nonce);
+    await doJoinMatch(nonce, player1Kp);
+
+    const p1Ata = await playerAta(player1Kp.publicKey);
+
+    let threw = false;
+    try {
+      // player1 is a staker, not the match authority.
+      await doCancelMatch(nonce, [p1Ata], player1Kp);
+    } catch (e: unknown) {
+      threw = true;
+      const msg = (e as Error).message ?? "";
+      assert.include(msg, "Unauthorized", `unexpected error: ${msg}`);
+    }
+    assert.isTrue(threw, "expected Unauthorized error");
+  });
+
+  it("cancel_match on an already-started match is rejected with NotOpen", async () => {
+    const nonce = 16n;
+    await doCreateMatch(nonce);
+    // Filling to MAX_PLAYERS flips the match to InProgress.
+    await doJoinMatch(nonce, player1Kp);
+    await doJoinMatch(nonce, player2Kp);
+
+    const p1Ata = await playerAta(player1Kp.publicKey);
+    const p2Ata = await playerAta(player2Kp.publicKey);
+
+    let threw = false;
+    try {
+      await doCancelMatch(nonce, [p1Ata, p2Ata]);
+    } catch (e: unknown) {
+      threw = true;
+      const msg = (e as Error).message ?? "";
+      assert.include(msg, "NotOpen", `unexpected error: ${msg}`);
+    }
+    assert.isTrue(threw, "expected NotOpen error");
+  });
 });

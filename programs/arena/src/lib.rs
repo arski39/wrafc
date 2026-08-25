@@ -3,7 +3,7 @@ pub mod instructions;
 pub mod state;
 
 use anchor_lang::prelude::*;
-use instructions::{CreateMatch, JoinMatch, SettleMatch};
+use instructions::{CancelMatch, CreateMatch, JoinMatch, SettleMatch};
 
 declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
 
@@ -31,5 +31,11 @@ pub mod arena {
         scores: Vec<u64>,
     ) -> Result<()> {
         instructions::settle_match::handler(ctx, winner, scores)
+    }
+
+    /// Refunds every staker and closes the match. Authority-only, Open status only.
+    /// Ported from the OpenFrontIO copy of this program during the engine pivot.
+    pub fn cancel_match(ctx: Context<CancelMatch>) -> Result<()> {
+        instructions::cancel_match::handler(ctx)
     }
 }

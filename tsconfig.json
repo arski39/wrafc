@@ -11,5 +11,5 @@
     "skipLibCheck": true
   },
   "include": ["tests/**/*.ts"],
-  "exclude": ["node_modules", "client", "server", "OpenFrontIO"]
+  "exclude": ["node_modules", "OpenFrontIO"]
 }
