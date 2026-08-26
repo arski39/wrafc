@@ -262,9 +262,9 @@ which is what it must now match.
   toolchain above; `arena.so` + IDL + types are generated.
 - **Tests**: 31 passing on the program side (`tests/arena.ts` for behaviour,
   `tests/arenaProgram.ts` for the shared bindings, decoder and settlement), and
-  3342 passing on the game side (`npm test` from `OpenFrontIO/`, including
-  `tests/ArenaWalletAuth.test.ts`, `tests/server/ArenaStartGate.test.ts`,
-  `tests/server/AppShellBranding.test.ts` and `tests/server/ArenaDevBypass.test.ts`).
+  3376 passing on the game side (`npm test` from `OpenFrontIO/`, including
+  `tests/ArenaWalletAuth.test.ts` and, under `tests/server/`, `ArenaStartGate`,
+  `AppShellBranding`, `ArenaDevBypass` and `ArenaPreflight`).
 - **OpenFrontIO wager integration**: the full stake loop is wired — host creates the
   escrow, every player (host included) stakes into it. Working: `arena/auth.ts` +
   `client/arena/walletAuth.ts` (SIWS-style wallet signature), `matchRegistry`,
@@ -350,14 +350,50 @@ dependency order:
 | **2** | `ARENA_DEV_BYPASS` containment + stake cap | ✅ ofio `cecbe4b` |
 | **H5** | Stop shipping upstream's identity (licensing) | ✅ ofio `8a9ab4d` |
 | **H3** | Program: timeout-cancel for a stranded `InProgress` match | ✅ root `552425c` |
-| **H1** | Arena env vars + keypair mount through the deploy path | todo |
+| **H1** | Arena env vars + keypair mount + boot preflight | ✅ ofio `f1b3832` |
 | **H2** | Recovery sweeper (master-only, enumerates by authority) | todo, needs H1+H3 |
 | **H4** | Auth service — JWKS, `/auth/refresh`, `/auth/wallet`, `/users/@me` | todo |
 | **H6** | The Oracle Cloud box | todo, needs a domain + region |
 | **3** | Devnet deploy + live validation (S1–S7) | needs H3 first |
 | **4** | Server-side replay winner determination | **mainnet gate** |
 
-**H1 is the next unblocked item.** H2's sweeper needs it; H6 needs the domain.
+**H2 (the recovery sweeper) is the next unblocked item.** H6 needs the domain.
+
+### H1 — the arena now reaches a real deployment (done)
+Three things were missing between the code and a deployed container:
+- **`deploy.sh`'s env heredoc is a fixed list** and had no `ARENA_*` in it, so a
+  deploy silently produced a free-to-play server.
+- **`SERVER_KEYPAIR_PATH` is a file path and nothing mounted a file.** It now
+  arrives as a **read-only bind mount** (`ARENA_AUTHORITY_KEYPAIR` on the host →
+  `/run/secrets/arena-authority.json`), never an env var — an env var would sit in
+  `docker inspect`, in the deploy env file, in `ps`, and in any crash dump that
+  prints the environment. `update.sh` appends `SERVER_KEYPAIR_PATH` itself, since
+  it must name the in-container path. It also **refuses to start when the source
+  file is missing**: Docker silently creates a *directory* for an absent bind
+  source, which would surface later as an unreadable keypair.
+- **`RESTART=no`** unless the subdomain was `main`. Setting `ARENA_AUTHORITY_KEYPAIR`
+  now forces `--restart=always` — a wagering server that stays down after a crash
+  leaves live escrows with nothing to settle or refund them, and the sweeper only
+  runs while the process does.
+
+### `arena/preflight.ts` — verify at boot, not when a host presses the button
+`wageringConfigured()` only asked whether two env vars were non-empty, and is gone.
+`runWagerPreflight()` additionally loads the keypair, confirms the program account
+exists **and is executable on this cluster**, and checks the authority's balance
+against `MIN_AUTHORITY_LAMPORTS`. `wagerAvailable` on `GET /api/game/:id` reports
+the verified answer, so the host UI no longer advertises an escrow the server
+cannot create.
+
+**The check that matters most is the rake one.** `ARENA_RAKE_BPS > 0` with no
+`TREASURY_TOKEN_ACCOUNT` used to fail at *settlement* — by which point the stakes
+are in the vault and `settler.ts` correctly refuses to guess where the rake goes,
+so the pot just sits there. At boot it is a one-line refusal instead.
+
+Disabling wagering is safe by construction: it is the same state as a server that
+was never configured for it. A misconfiguration is distinguished from a deliberate
+free-to-play server — `ARENA_PROGRAM_ID` unset is `off` and logs at info, anything
+malformed is `broken` and logs at error, and `/wager` returns the reason so it is
+diagnosable without a log dive.
 
 ### Phase 2 — the dev bypass is opt-in *and* cluster-gated (done)
 Two bypasses used to fire on `GameEnv.Dev` alone — the `jti`-nonce fallback in
@@ -635,6 +671,9 @@ when you add a template variable.
   embeds an API key, because this value is served to every player.
 - `ARENA_RAKE_BPS` — house cut, 0..1000. Operator-set, never host-set.
 - `TREASURY_TOKEN_ACCOUNT` — rake destination token account (needed once rake > 0)
+- `ARENA_AUTHORITY_KEYPAIR` — **deploy only**, path to the keypair *on the target
+  host*. `update.sh` bind-mounts it read-only and sets `SERVER_KEYPAIR_PATH` to the
+  in-container path itself. Setting it also forces `--restart=always`.
 - `ARENA_DEV_BYPASS` — **dev only, default off.** Skips the wallet-signature session
   binding and the on-chain stake check. Only honoured when `GAME_ENV=dev` **and** the
   cluster's genesis hash proves it is not mainnet; refused if the RPC is unreachable.
