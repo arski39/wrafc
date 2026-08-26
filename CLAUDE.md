@@ -262,9 +262,9 @@ which is what it must now match.
   toolchain above; `arena.so` + IDL + types are generated.
 - **Tests**: 31 passing on the program side (`tests/arena.ts` for behaviour,
   `tests/arenaProgram.ts` for the shared bindings, decoder and settlement), and
-  3376 passing on the game side (`npm test` from `OpenFrontIO/`, including
+  3418 passing on the game side (`npm test` from `OpenFrontIO/`, including
   `tests/ArenaWalletAuth.test.ts` and, under `tests/server/`, `ArenaStartGate`,
-  `AppShellBranding`, `ArenaDevBypass` and `ArenaPreflight`).
+  `AppShellBranding`, `ArenaDevBypass`, `ArenaPreflight` and `ArenaSweeper`).
 - **OpenFrontIO wager integration**: the full stake loop is wired — host creates the
   escrow, every player (host included) stakes into it. Working: `arena/auth.ts` +
   `client/arena/walletAuth.ts` (SIWS-style wallet signature), `matchRegistry`,
@@ -351,13 +351,14 @@ dependency order:
 | **H5** | Stop shipping upstream's identity (licensing) | ✅ ofio `8a9ab4d` |
 | **H3** | Program: timeout-cancel for a stranded `InProgress` match | ✅ root `552425c` |
 | **H1** | Arena env vars + keypair mount + boot preflight | ✅ ofio `f1b3832` |
-| **H2** | Recovery sweeper (master-only, enumerates by authority) | todo, needs H1+H3 |
+| **H2** | Recovery sweeper (master-only, enumerates by authority) | ✅ ofio `fca7567` |
 | **H4** | Auth service — JWKS, `/auth/refresh`, `/auth/wallet`, `/users/@me` | todo |
 | **H6** | The Oracle Cloud box | todo, needs a domain + region |
 | **3** | Devnet deploy + live validation (S1–S7) | needs H3 first |
 | **4** | Server-side replay winner determination | **mainnet gate** |
 
-**H2 (the recovery sweeper) is the next unblocked item.** H6 needs the domain.
+**H4 (the auth service) is the next unblocked item** — and the last thing in
+Phase H that does not need the domain. H6 waits on it.
 
 ### H1 — the arena now reaches a real deployment (done)
 Three things were missing between the code and a deployed container:
@@ -375,6 +376,56 @@ Three things were missing between the code and a deployed container:
   now forces `--restart=always` — a wagering server that stays down after a crash
   leaves live escrows with nothing to settle or refund them, and the sweeper only
   runs while the process does.
+
+### H2 — the recovery sweeper (done)
+
+`matchRegistry` is a module-level `Map` inside each **worker**. A worker crash
+(the master reforks it), a redeploy, or an OOM drops every live wager, and with
+it the only pointer the server held to tokens still sitting in a vault. Hosting
+makes that routine rather than exceptional.
+
+`arena/sweeper.ts` recovers them from chain state alone. `MatchAccount` already
+records `authority`, `vault`, `players[]`, `stakes[]`, `status` and `created_at`,
+so `getProgramAccounts` filtered on the authority enumerates every escrow this
+server ever created with **no server-side persistence at all**. That is exactly
+why it survives the thing that destroyed the registry: it never reads it.
+
+- **Master-only, and that is load-bearing.** N workers sweeping means N
+  concurrent `cancel_match` transactions per orphan — one succeeds, the rest
+  pay a fee to be rejected. The master supervises the workers, holds the same
+  env and therefore the same keypair, and does no other arena work. It runs its
+  own `runWagerPreflight()` first, because it is about to sign transactions;
+  `startSweeper()` is a no-op unless that passed. In-process, an `inFlight`
+  guard keeps a slow sweep from overlapping the next tick.
+- **`InProgress` reuses `MATCH_TIMEOUT_SECS`** — the deadline `cancel_match`
+  enforces itself. A shorter sweeper-side number would only submit doomed
+  transactions.
+- **The `Open` window is the dangerous one.** The program accepts a cancel on an
+  `Open` match at *any* age, so nothing on chain stops the sweeper refunding a
+  lobby that is still filling — the constant is the only thing that does.
+  **The plan's 2 h was wrong.** A private lobby with no armed start timer sits in
+  the `Lobby` phase for the full `maxGameDuration` of 3 h (`lessThanLifetime` in
+  `phase()` is unconditionally true without a `startsAt`), so 2 h would have
+  refunded players mid-lobby. It is now `MAX_GAME_DURATION_MS + 1 h`: past that,
+  `phase()` reports `Finished` and `end()`'s not-started branch refunds the lobby
+  itself, so an escrow still `Open` beyond it is one no live `GameServer` can be
+  managing — in this process or any other sharing the authority key. The extra
+  hour stops the sweeper racing that ordinary refund.
+- **`MAX_GAME_DURATION_MS` was hoisted** out of `GameServer`'s private field into
+  `core/Schemas.ts` so the window is *derived* rather than hand-copied. Two
+  copies of "3 hours" is exactly the drift that would reintroduce the bug.
+- **It queries each actionable status separately.** `getProgramAccounts` AND-s
+  its filters and offers no OR, and `cancel_match` sets `Cancelled` without ever
+  closing the account — with no `close` instruction anywhere, that terminal set
+  grows without bound for the life of the authority key. Filtering it out
+  server-side is what keeps a sweep the same size in year two.
+- **Errors are isolated per match**, not per sweep: one unrecoverable pot must
+  not strand every other one behind it.
+- `settler.ts`'s refund path was split into **`cancelAndRefund()`**, which takes
+  chain state and nothing else, so both callers share one implementation of the
+  `players[]`-order pairing `cancel_match` requires. It reads `vault` from the
+  account rather than the registry — which is what the program pins with
+  `address = match_account.vault` regardless.
 
 ### `arena/preflight.ts` — verify at boot, not when a host presses the button
 `wageringConfigured()` only asked whether two env vars were non-empty, and is gone.
