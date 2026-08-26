@@ -22,4 +22,9 @@ pub enum ArenaError {
     InvalidVault,
     #[msg("Unauthorized")]
     Unauthorized,
+    // Append only. Anchor numbers these positionally from 6000, so inserting a
+    // variant above silently renumbers every error after it -- including ones
+    // the TypeScript side matches on.
+    #[msg("Match has not been in progress long enough to be force-cancelled")]
+    MatchNotTimedOut,
 }

@@ -23,11 +23,12 @@ import {
   unpackAccount,
 } from "@solana/spl-token";
 import { BankrunProvider, startAnchor } from "anchor-bankrun";
-import { ProgramTestContext } from "solana-bankrun";
+import { Clock, ProgramTestContext } from "solana-bankrun";
 import { assert } from "chai";
 import nacl from "tweetnacl";
 import { createHash } from "crypto";
 import type { Arena } from "../target/types/arena";
+import { MATCH_TIMEOUT_SECS } from "../OpenFrontIO/src/core/arena/arenaProgram";
 
 // Helper: build sha256(matchPDA || winner || scores_le) matching on-chain reconstruction
 function buildSettleMessage(matchPDA: PublicKey, winner: PublicKey, scores: bigint[]): Buffer {
@@ -463,19 +464,143 @@ describe("arena", () => {
     assert.isTrue(threw, "expected Unauthorized error");
   });
 
-  it("cancel_match on an already-started match is rejected with NotOpen", async () => {
-    const nonce = 16n;
+  // MATCH_TIMEOUT_SECS is imported rather than restated: tests/arenaProgram.ts
+  // diffs that value against the IDL, so there is one number and it is pinned.
+  // The tests below still bracket the boundary -- one just under, one just over
+  // -- because matching the constant is not the same as the program actually
+  // enforcing the cutoff there.
+
+  /**
+   * Runs `fn` with the bank's clock pushed forward, then puts it back.
+   *
+   * Restoring matters: the context is shared by every test in this file, and a
+   * leaked warp would silently change what "before the timeout" means for
+   * whatever runs next.
+   */
+  async function withClockAdvancedBy<T>(
+    seconds: number,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const before = await context.banksClient.getClock();
+    context.setClock(
+      new Clock(
+        before.slot,
+        before.epochStartTimestamp,
+        before.epoch,
+        before.leaderScheduleEpoch,
+        before.unixTimestamp + BigInt(seconds),
+      ),
+    );
+    try {
+      return await fn();
+    } finally {
+      context.setClock(before);
+    }
+  }
+
+  /** Fills a match to MAX_PLAYERS, which flips it Open -> InProgress. */
+  async function doFilledMatch(nonce: bigint) {
     await doCreateMatch(nonce);
-    // Filling to MAX_PLAYERS flips the match to InProgress.
     await doJoinMatch(nonce, player1Kp);
     await doJoinMatch(nonce, player2Kp);
+    return {
+      p1Ata: await playerAta(player1Kp.publicKey),
+      p2Ata: await playerAta(player2Kp.publicKey),
+    };
+  }
 
-    const p1Ata = await playerAta(player1Kp.publicKey);
-    const p2Ata = await playerAta(player2Kp.publicKey);
+  it("cancel_match on an in-progress match before the timeout is rejected", async () => {
+    const nonce = 16n;
+    const { p1Ata, p2Ata } = await doFilledMatch(nonce);
 
     let threw = false;
     try {
-      await doCancelMatch(nonce, [p1Ata, p2Ata]);
+      await withClockAdvancedBy(MATCH_TIMEOUT_SECS - 60, () =>
+        doCancelMatch(nonce, [p1Ata, p2Ata]),
+      );
+    } catch (e: unknown) {
+      threw = true;
+      const msg = (e as Error).message ?? "";
+      assert.include(msg, "MatchNotTimedOut", `unexpected error: ${msg}`);
+    }
+    assert.isTrue(
+      threw,
+      "a live match must not be cancellable, or the authority could refund " +
+        "out from under a game in progress",
+    );
+  });
+
+  it("cancel_match on an in-progress match after the timeout refunds every staker", async () => {
+    // The recovery path for a filled match whose server died: settle_match
+    // needs a winner nobody can supply, so without this the pot is locked.
+    const nonce = 17n;
+    const { p1Ata, p2Ata } = await doFilledMatch(nonce);
+
+    const before1 = await getTokenAccount(p1Ata);
+    const before2 = await getTokenAccount(p2Ata);
+
+    const { match, vault } = await withClockAdvancedBy(
+      MATCH_TIMEOUT_SECS + 60,
+      () => doCancelMatch(nonce, [p1Ata, p2Ata]),
+    );
+
+    const after1 = await getTokenAccount(p1Ata);
+    const after2 = await getTokenAccount(p2Ata);
+    assert.equal(
+      Number(after1.amount) - Number(before1.amount),
+      Number(ENTRY_FEE),
+      "player1 should be refunded exactly their stake",
+    );
+    assert.equal(
+      Number(after2.amount) - Number(before2.amount),
+      Number(ENTRY_FEE),
+      "player2 should be refunded exactly their stake",
+    );
+
+    const vaultAcct = await getTokenAccount(vault);
+    assert.equal(Number(vaultAcct.amount), 0, "vault should be drained");
+
+    const acct = await program.account.matchAccount.fetch(match);
+    assert.isTrue("cancelled" in acct.status, "match status should be Cancelled");
+  });
+
+  it("settle_match still works after the cancel timeout has passed", async () => {
+    // The timeout must be an extra escape hatch, not a deadline on settlement.
+    // A server that recovers late should still be able to pay the winner.
+    const nonce = 18n;
+    await doFilledMatch(nonce);
+
+    const winner = player1Kp.publicKey;
+    const winnerAtaAddr = await playerAta(winner);
+    const before = await getTokenAccount(winnerAtaAddr);
+
+    const { match } = await withClockAdvancedBy(MATCH_TIMEOUT_SECS + 3600, () =>
+      doSettleMatch(nonce, winner, [10n, 5n]),
+    );
+
+    const after = await getTokenAccount(winnerAtaAddr);
+    assert.isAbove(
+      Number(after.amount),
+      Number(before.amount),
+      "winner should still be paid after the timeout",
+    );
+    const acct = await program.account.matchAccount.fetch(match);
+    assert.isTrue("settled" in acct.status, "match status should be Settled");
+  });
+
+  it("cancel_match on a settled match is rejected with NotOpen", async () => {
+    // Terminal states stay terminal however long you wait -- the timeout
+    // branch must apply only to InProgress, or a paid-out match could be
+    // "refunded" a second time from an empty vault.
+    const nonce = 19n;
+    const { p1Ata, p2Ata } = await doFilledMatch(nonce);
+    await doSettleMatch(nonce, player1Kp.publicKey, [10n, 5n]);
+
+    let threw = false;
+    try {
+      await withClockAdvancedBy(MATCH_TIMEOUT_SECS + 60, () =>
+        doCancelMatch(nonce, [p1Ata, p2Ata]),
+      );
     } catch (e: unknown) {
       threw = true;
       const msg = (e as Error).message ?? "";

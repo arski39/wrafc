@@ -2,6 +2,19 @@ use anchor_lang::prelude::*;
 
 pub const MAX_PLAYERS: usize = 16;
 
+/// How long after `created_at` an `InProgress` match may be force-cancelled.
+///
+/// Exists because `settle_match` accepts only `InProgress` and `cancel_match`
+/// accepted only `Open`, which left a filled match whose server died with no
+/// on-chain path out at all -- the pot was locked forever. Hosting means
+/// restarts, so that is an operational certainty rather than an edge case.
+///
+/// 24h is deliberately far longer than any real match (an OpenFront game runs
+/// well under an hour), so this can only fire on a genuine orphan and never
+/// races a slow-but-live settlement.
+#[constant]
+pub const MATCH_TIMEOUT_SECS: i64 = 24 * 60 * 60;
+
 #[account]
 pub struct MatchAccount {
     pub authority: Pubkey,

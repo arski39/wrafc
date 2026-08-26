@@ -99,12 +99,15 @@ A `Cargo.lock` is now committed. Keep it committed.
 
 ## Status of on-chain verification — ✅ GREEN
 - `anchor build` passes. Produces `target/deploy/arena.so`, `target/idl/arena.json`
-  (all four instructions incl. `cancel_match`, 10 errors), `target/types/arena.ts`.
-- `anchor test --skip-deploy --skip-local-validator` — **27 passing, 0 failing.**
-  - `tests/arena.ts` (7): happy path, rake math, double-join rejected, bad-signature
-    rejected, plus the three `cancel_match` tests (refund, non-authority rejected,
-    already-started rejected).
-  - `tests/arenaProgram.ts` (20): pins the hand-rolled program bindings
+  (all four instructions incl. `cancel_match`, **11** errors, and one `#[constant]`),
+  `target/types/arena.ts`.
+- `anchor test --skip-deploy --skip-local-validator` — **31 passing, 0 failing.**
+  - `tests/arena.ts` (10): happy path, rake math, double-join rejected,
+    bad-signature rejected, and the six `cancel_match` tests — refund,
+    non-authority rejected, in-progress-before-timeout rejected,
+    in-progress-after-timeout refunds, settle still works past the timeout,
+    settled-match cancel rejected.
+  - `tests/arenaProgram.ts` (21): pins the hand-rolled program bindings
     (`OpenFrontIO/src/core/arena/arenaProgram.ts`) — see below.
 
 Use `--skip-deploy --skip-local-validator`. Plain `anchor test` fails: `--skip-local-validator`
@@ -257,7 +260,7 @@ which is what it must now match.
   `create_match` (vault is a real PDA-owned ATA), `join_match`, `settle_match`
   (on-chain ed25519 verified), `cancel_match` (ported, hardened). **Compiles** under the
   toolchain above; `arena.so` + IDL + types are generated.
-- **Tests**: 27 passing on the program side (`tests/arena.ts` for behaviour,
+- **Tests**: 31 passing on the program side (`tests/arena.ts` for behaviour,
   `tests/arenaProgram.ts` for the shared bindings, decoder and settlement), and
   3301 passing on the game side (`npm test` from `OpenFrontIO/`, including
   `tests/ArenaWalletAuth.test.ts`, `tests/server/ArenaStartGate.test.ts` and
@@ -276,7 +279,7 @@ which is what it must now match.
   `cancel_match` when the lobby never filled).
 - **The wager loop is closed end to end**: create escrow → stake → play → pay out,
   and **Stage 6** makes it exercisable locally without the closed-source auth API.
-  Every stage in the task queue is done; what remains are the open issues below.
+  All six integration stages are done — see the roadmap below for what is not.
 - Wagering is inert unless `ARENA_PROGRAM_ID` is set.
 - **Never run against mainnet in this state.** Beyond the client-vote risk below, none
   of this has been exercised against a live cluster — every proof so far is bankrun.
@@ -337,8 +340,61 @@ Note also that `cancelUnfilledWageredMatch()` kicks with `kick_reason.wager_not_
 **not** `kick_reason.match_cancelled`: the latter's client handler pushes the player back
 into the matchmaking queue, which is wrong for a private lobby the host built by hand.
 
-## Task Queue — remaining work, in order
-Each stage is gated on `npx tsc --noEmit` (from `OpenFrontIO/`) before moving on.
+## Roadmap — where this actually is
+Full plan: `~/.claude/plans/where-are-we-on-staged-snowflake.md`. Phases, in
+dependency order:
+
+| Phase | What | State |
+|---|---|---|
+| **1** | Wagered start-gate + refund the unstartable | ✅ root `a283bfc`, ofio `c76ed24` |
+| **2** | `ARENA_DEV_BYPASS` containment — dev must not move real tokens | **blocked on two decisions** (see below) |
+| **H5** | Stop shipping upstream's identity (licensing) | ✅ ofio `8a9ab4d` |
+| **H3** | Program: timeout-cancel for a stranded `InProgress` match | ✅ root `HEAD` |
+| **H1** | Arena env vars + keypair mount through the deploy path | todo |
+| **H2** | Recovery sweeper (master-only, enumerates by authority) | todo, needs H1+H3 |
+| **H4** | Auth service — JWKS, `/auth/refresh`, `/auth/wallet`, `/users/@me` | todo |
+| **H6** | The Oracle Cloud box | todo, needs a domain + region |
+| **3** | Devnet deploy + live validation (S1–S7) | needs H3 first |
+| **4** | Server-side replay winner determination | **mainnet gate** |
+
+**Open decisions** blocking Phase 2: whether bypass-on + non-devnet RPC should
+refuse to boot or only warn; and whether the client learns the bypass state from
+`GET /api/game/:id` or is left to be rejected by the server.
+
+**H1 is the next unblocked item.** H2's sweeper needs it, and H4/H6 need inputs.
+
+### H3 — the `InProgress` escape hatch (done, and why it matters)
+`settle_match` accepts only `InProgress`; `cancel_match` used to accept only
+`Open`. A lobby that filled and then lost its server therefore had **no on-chain
+path out at all** — that pot was locked permanently, and hosting makes server
+restarts a certainty rather than an edge case.
+
+`cancel_match` now also accepts `InProgress` once `MATCH_TIMEOUT_SECS` (24 h) has
+elapsed since `created_at`. Notes:
+- **The status gate moved off the `Accounts` struct into the handler**, because
+  the `InProgress` case is conditional on the clock and an account constraint
+  cannot express that. Anything editing that struct must leave the handler's
+  `require!` in place — removing it lets the authority cancel a live match
+  mid-play. A mutation test covers exactly this.
+- **This does not widen who is trusted.** The authority already signs the digest
+  that decides the payout, so it could always deny a winner; the timeout only
+  adds a delayed refund that returns the money to the players.
+- **`ArenaError` is append-only.** Anchor numbers variants positionally from
+  6000, so inserting one silently renumbers every error after it — including the
+  codes TypeScript matches on. `MatchNotTimedOut` is 6010; 6000–6009 are unmoved.
+- **24 h is deliberately far longer than any match**, so it can never race a
+  slow-but-live settlement. `settle_match` keeps working past the deadline — a
+  server that recovers late still pays the winner, and a test asserts it.
+- `MATCH_TIMEOUT_SECS` is marked `#[constant]`, so it reaches the IDL and the
+  TypeScript mirror in `core/arena/arenaProgram.ts` is **diffed against it**
+  rather than hand-copied. It is the only arena constant with a real IDL pin:
+  `MAX_PLAYERS` is pinned indirectly by `MATCH_ACCOUNT_SIZE` and the field
+  offsets, `MAX_RAKE_BPS` by `create_match`'s own rejection — the timeout had no
+  such second anchor, and H2's sweeper reads it to decide when to try a cancel.
+
+## Completed integration stages — notes worth keeping
+Each stage was gated on `npx tsc --noEmit` (from `OpenFrontIO/`) before moving on.
+Kept for the constraints they record, not as remaining work.
 
 2. ~~**`matchCreator.ts`** — real `create_match` submission + `POST /api/game/:id/wager`
    + wager info on `GET /api/game/:id` + host UI.~~ **DONE.** Notes for later stages:

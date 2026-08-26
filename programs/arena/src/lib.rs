@@ -33,7 +33,10 @@ pub mod arena {
         instructions::settle_match::handler(ctx, winner, scores)
     }
 
-    /// Refunds every staker and closes the match. Authority-only, Open status only.
+    /// Refunds every staker and closes the match. Authority-only. Accepts an
+    /// `Open` match at any time, and an `InProgress` one only after
+    /// `MATCH_TIMEOUT_SECS` -- the recovery path for a filled match whose
+    /// server died before settling, which is otherwise unrecoverable.
     /// Ported from the OpenFrontIO copy of this program during the engine pivot.
     pub fn cancel_match<'info>(
         ctx: Context<'_, '_, '_, 'info, CancelMatch<'info>>,

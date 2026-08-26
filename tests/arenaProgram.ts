@@ -41,6 +41,7 @@ import {
   MATCH_ACCOUNT_DISCRIMINATOR,
   MATCH_ACCOUNT_LAYOUT,
   MATCH_ACCOUNT_SIZE,
+  MATCH_TIMEOUT_SECS,
   MAX_PLAYERS,
   MAX_RAKE_BPS,
   MatchStatus,
@@ -78,6 +79,7 @@ interface ArenaIdl {
     args: IdlField[];
   }[];
   accounts: { name: string; discriminator: number[] }[];
+  constants: { name: string; type: string; value: string }[];
   types: {
     name: string;
     type:
@@ -274,6 +276,22 @@ describe("arenaProgram bindings", () => {
       assert.equal(MAX_PLAYERS, 16);
       assert.equal(MAX_RAKE_BPS, 1000);
       assert.equal(ARENA_TOKEN_PROGRAM_ID.toBase58(), TOKEN_PROGRAM_ID.toBase58());
+    });
+
+    it("MATCH_TIMEOUT_SECS is diffed against the IDL, not hand-copied", () => {
+      // The only arena constant the IDL actually carries (it is #[constant] in
+      // Rust). MAX_PLAYERS and MAX_RAKE_BPS above are literal assertions, but
+      // both are pinned indirectly -- MAX_PLAYERS by MATCH_ACCOUNT_SIZE and the
+      // field offsets, MAX_RAKE_BPS by create_match's own rejection. The
+      // timeout has no such second anchor, so it needs this one.
+      const fromIdl = idl.constants.find((c) => c.name === "MATCH_TIMEOUT_SECS");
+      assert.isDefined(fromIdl, "MATCH_TIMEOUT_SECS missing from the IDL");
+      assert.equal(fromIdl!.type, "i64");
+      assert.equal(
+        Number(fromIdl!.value),
+        MATCH_TIMEOUT_SECS,
+        "arenaProgram.ts MATCH_TIMEOUT_SECS has drifted from the program",
+      );
     });
   });
 
