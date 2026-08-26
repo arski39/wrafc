@@ -257,8 +257,10 @@ which is what it must now match.
   `create_match` (vault is a real PDA-owned ATA), `join_match`, `settle_match`
   (on-chain ed25519 verified), `cancel_match` (ported, hardened). **Compiles** under the
   toolchain above; `arena.so` + IDL + types are generated.
-- **Tests**: 27 passing across `tests/arena.ts` (program behaviour) and
-  `tests/arenaProgram.ts` (the shared program bindings, decoder and settlement).
+- **Tests**: 27 passing on the program side (`tests/arena.ts` for behaviour,
+  `tests/arenaProgram.ts` for the shared bindings, decoder and settlement), and
+  3249 passing on the game side (`npm test` from `OpenFrontIO/`, including
+  `tests/ArenaWalletAuth.test.ts`).
 - **OpenFrontIO wager integration**: the full stake loop is wired — host creates the
   escrow, every player (host included) stakes into it. Working: `arena/auth.ts` +
   `client/arena/walletAuth.ts` (SIWS-style wallet signature), `matchRegistry`,
@@ -271,9 +273,9 @@ which is what it must now match.
   **Stage 4** (`rpcClient.ts` reads and decodes the real `MatchAccount`), and
   **Stage 5** (`settler.ts` signs the correct digest and submits `settle_match`, or
   `cancel_match` when the lobby never filled).
-- **The wager loop is closed end to end**: create escrow → stake → play → pay out.
-  What remains is Stage 6 (a dev-mode auth bypass so the path can be exercised locally)
-  and the open issues below.
+- **The wager loop is closed end to end**: create escrow → stake → play → pay out,
+  and **Stage 6** makes it exercisable locally without the closed-source auth API.
+  Every stage in the task queue is done; what remains are the open issues below.
 - Wagering is inert unless `ARENA_PROGRAM_ID` is set.
 - **Never run against mainnet in this state.** Beyond the client-vote risk below, none
   of this has been exercised against a live cluster — every proof so far is bankrun.
@@ -402,10 +404,36 @@ Each stage is gated on `npx tsc --noEmit` (from `OpenFrontIO/`) before moving on
    - The old dev-mode short-circuit is gone. A registry entry always means a real
      on-chain escrow, so skipping submission in dev would not avoid touching the chain —
      it would strand real tokens.
-6. **Dev-mode auth bypass** — `Worker.ts`'s wagered-join gate requires a `jti` claim
-   with no dev bypass, while the on-chain check right beside it *does* bypass in dev.
-   Local/anonymous dev sessions never have a `jti`, so the wagered path is currently
-   untestable without the closed-source auth API. Add a symmetric dev bypass.
+6. ~~**Dev-mode auth bypass** — symmetric `jti` bypass in the wagered-join gate.~~
+   **DONE.** Notes:
+   - The nonce the wallet signs is normally the JWT's `jti`, which binds the signature to
+     one login session. Dev sessions are anonymous — `getPlayToken()` returns a bare
+     persistentID and `verifyClientToken` returns `claims: null` for it — so there was no
+     nonce and the wagered path could not be exercised locally at all.
+   - The dev substitute is the **game id**, not the persistentID: the latter is PII the
+     wallet would display in its signing prompt, and `Auth.ts` is explicit that it must
+     not be exposed. The game id still binds the signature to one match; what it gives
+     up is the session binding, which is exactly why it is refused outside dev.
+   - Both halves must choose the nonce identically, so the choice and the message format
+     live in one shared place, `core/arena/authMessage.ts`. The prefix used to be
+     declared twice with a "must match server" comment — the classic silent-drift setup,
+     where the only symptom is an unexplained invalid-signature disconnect.
+   - The client refuses **before** prompting the wallet when a non-dev session has no
+     `jti`, so nobody is asked to sign something the server will reject.
+   - `tests/ArenaWalletAuth.test.ts` signs with the client code and verifies with the
+     **real** `verifyWalletSig`, not a copy of it, so the two ends cannot drift apart.
+
+### Testing the wager loop locally — read this first
+Two things will otherwise waste an afternoon:
+
+- **The dev bypass on the on-chain membership check is separate and still active.**
+  `Worker.ts` skips `verifyOnchainMembership` in dev, so a dev player joins a wagered
+  lobby whether or not they actually staked. If nobody stakes, the match never reaches
+  `InProgress` and settlement **refunds instead of paying out** (see the section above).
+  To exercise a real payout locally, every seat has to genuinely `join_match`.
+- **Wagering needs a deployed program**, a funded `SERVER_KEYPAIR_PATH`, and
+  `ARENA_PROGRAM_ID` set. With `ARENA_PROGRAM_ID` empty the host UI hides the stake
+  control and every lobby stays free — which is the correct default, not a failure.
 
 ## Conventions
 - Commits: conventional commits (`feat(arena):`, `fix(program):`, …).
@@ -414,7 +442,11 @@ Each stage is gated on `npx tsc --noEmit` (from `OpenFrontIO/`) before moving on
   merges tractable.
 - Checks before declaring done:
   - Program: from WSL, `anchor build && anchor test --skip-deploy --skip-local-validator`
-  - Game: from `OpenFrontIO/`, `npx tsc --noEmit` and `npm run lint`
+  - Game: from `OpenFrontIO/`, `npx tsc --noEmit`, `npm run lint`, **and `npm test`**
+    (`vitest run && vitest run tests/server`). Do not skip the vitest run: `en.json`
+    additions are checked for **nested** key ordering by `tests/EnJsonSorted.test.ts`,
+    which tsc and lint know nothing about. Stage 3 shipped an unsorted `wager_lobby`
+    block that stayed broken until Stage 6 because only tsc/lint/build were run.
   - `OpenFrontIO` tsc is **clean — zero errors**. It carried 2 pre-existing errors
     until Stage 5 (`arena/settler.ts` possibly-undefined, `GameServer.ts`
     null-assignability); both are gone. Any error at all now means you introduced it.
