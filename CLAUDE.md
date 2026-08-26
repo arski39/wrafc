@@ -259,8 +259,8 @@ which is what it must now match.
   toolchain above; `arena.so` + IDL + types are generated.
 - **Tests**: 27 passing on the program side (`tests/arena.ts` for behaviour,
   `tests/arenaProgram.ts` for the shared bindings, decoder and settlement), and
-  3249 passing on the game side (`npm test` from `OpenFrontIO/`, including
-  `tests/ArenaWalletAuth.test.ts`).
+  3279 passing on the game side (`npm test` from `OpenFrontIO/`, including
+  `tests/ArenaWalletAuth.test.ts` and `tests/server/ArenaStartGate.test.ts`).
 - **OpenFrontIO wager integration**: the full stake loop is wired — host creates the
   escrow, every player (host included) stakes into it. Working: `arena/auth.ts` +
   `client/arena/walletAuth.ts` (SIWS-style wallet signature), `matchRegistry`,
@@ -284,19 +284,57 @@ which is what it must now match.
   them), so `npm ci` was impossible. Resolved with `npm install --ignore-scripts`.
   Use `npm run inst` from now on, per `OpenFrontIO/CLAUDE.md`.
 
-## ⚠️ A wagered lobby must fill, or it refunds
+## A wagered lobby must fill before it can start — now enforced
 `settle_match` only accepts a match in `InProgress`, and `join_match` sets that status
 only when `player_count` reaches `max_players`. A wagered lobby that starts with empty
-staked seats therefore **cannot be paid out at all** — the program will refuse it.
+staked seats therefore **cannot be paid out at all**, so every such match would be played
+and then refunded.
 
-`settler.ts` handles this by refunding every staker via `cancel_match` instead of
-leaving the pot in the vault, so no money is lost. But from a player's point of view the
-match was played and nobody won it, which is a poor experience.
+Closed in three places, all gating on the same predicate — `wagerReadyToStart()` in
+`arena/matchRegistry.ts`, which asks whether the escrow reports `InProgress`:
 
-The operational rule is: **`maxPlayers` on the wager must equal the number of players
-who will actually play.** There is currently nothing in the lobby UI enforcing that the
-host waits for every staked seat before starting, which is worth closing before this is
-used for anything real.
+1. **`toggle_game_start_timer`** (`GameServer.ts`) rejects with `wager_lobby_not_full`
+   and sends the host a `ServerErrorMessage` so the start button does not silently
+   no-op. Disarming an already-armed timer is always allowed — otherwise a host whose
+   cached fill state regressed would be stuck with a timer they cannot cancel.
+2. **`cancelUnfilledWageredMatch()`**, called from `GameManager.tick()` beside the
+   existing `cancelShortHandedMatch()`, cancels at the start deadline if the gate was
+   somehow bypassed.
+3. **The refund** (below) releases the stakes either way.
+
+**Why `InProgress` and not a seat count:** it is the exact condition `settle_match`
+requires, so the gate cannot drift from the settlement rule. A lobby the gate lets start
+is one that can pay out; one it blocks could only ever have refunded.
+
+**Why a cached value is acceptable:** `handleIntent` is synchronous and cannot await an
+RPC, so the fill state is cached from the read `verifyOnchainMembership` already performs
+on every wagered join — which is also the only moment it can change. Being wrong is safe
+in both directions: blocking a startable match costs the host a retry, and allowing an
+unstartable one still refunds through `settler.ts`.
+
+`maxPlayers` on the wager still has to equal the number of players who will actually
+play — the gate enforces it rather than merely documenting it, but it cannot conjure a
+missing player.
+
+## ⚠️ An abandoned wagered lobby used to strand its stakes
+Fixed, but worth knowing because the shape of it will recur: **settlement rides on
+`archiveGame()`, and `end()` returns before that whenever a game never started**
+(`!_hasPrestarted && !_hasStarted`). A wagered lobby whose host never pressed start left
+every stake sitting in the vault with nothing left to release it.
+
+`end()`'s not-started branch now calls `refundWageredLobby()`, which delegates to the
+existing `settle(gameId, null, allClients)`. No new settlement logic: `settle()` reads the
+escrow itself and only refunds when the chain says `Open`, so a match that did somehow
+reach `InProgress` is left alone rather than guessed at.
+
+**This is the single refund site.** `cancelUnfilledWageredMatch()` deliberately does not
+refund inline — it sets `_hasEnded`, `phase()` reports `Finished`, `GameManager` calls
+`end()`, and the refund happens there. Anything else that cancels a wagered lobby
+pre-start should route the same way rather than adding a second call.
+
+Note also that `cancelUnfilledWageredMatch()` kicks with `kick_reason.wager_not_full`,
+**not** `kick_reason.match_cancelled`: the latter's client handler pushes the player back
+into the matchmaking queue, which is wrong for a private lobby the host built by hand.
 
 ## Task Queue — remaining work, in order
 Each stage is gated on `npx tsc --noEmit` (from `OpenFrontIO/`) before moving on.
@@ -428,9 +466,10 @@ Two things will otherwise waste an afternoon:
 
 - **The dev bypass on the on-chain membership check is separate and still active.**
   `Worker.ts` skips `verifyOnchainMembership` in dev, so a dev player joins a wagered
-  lobby whether or not they actually staked. If nobody stakes, the match never reaches
-  `InProgress` and settlement **refunds instead of paying out** (see the section above).
-  To exercise a real payout locally, every seat has to genuinely `join_match`.
+  lobby whether or not they actually staked. Since that read is also what feeds the
+  start-gate's cached fill state, an unstaked dev lobby now **refuses to start at all**
+  (`wager_lobby_not_full`) rather than playing and refunding. To exercise a payout
+  locally, every seat has to genuinely `join_match`.
 - **Wagering needs a deployed program**, a funded `SERVER_KEYPAIR_PATH`, and
   `ARENA_PROGRAM_ID` set. With `ARENA_PROGRAM_ID` empty the host UI hides the stake
   control and every lobby stays free — which is the correct default, not a failure.
