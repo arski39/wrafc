@@ -100,11 +100,11 @@ A `Cargo.lock` is now committed. Keep it committed.
 ## Status of on-chain verification — ✅ GREEN
 - `anchor build` passes. Produces `target/deploy/arena.so`, `target/idl/arena.json`
   (all four instructions incl. `cancel_match`, 10 errors), `target/types/arena.ts`.
-- `anchor test --skip-deploy --skip-local-validator` — **21 passing, 0 failing.**
+- `anchor test --skip-deploy --skip-local-validator` — **27 passing, 0 failing.**
   - `tests/arena.ts` (7): happy path, rake math, double-join rejected, bad-signature
     rejected, plus the three `cancel_match` tests (refund, non-authority rejected,
     already-started rejected).
-  - `tests/arenaProgram.ts` (14): pins the hand-rolled program bindings
+  - `tests/arenaProgram.ts` (20): pins the hand-rolled program bindings
     (`OpenFrontIO/src/core/arena/arenaProgram.ts`) — see below.
 
 Use `--skip-deploy --skip-local-validator`. Plain `anchor test` fails: `--skip-local-validator`
@@ -257,8 +257,8 @@ which is what it must now match.
   `create_match` (vault is a real PDA-owned ATA), `join_match`, `settle_match`
   (on-chain ed25519 verified), `cancel_match` (ported, hardened). **Compiles** under the
   toolchain above; `arena.so` + IDL + types are generated.
-- **Tests**: 21 passing across `tests/arena.ts` (program behaviour) and
-  `tests/arenaProgram.ts` (the shared program bindings + decoder).
+- **Tests**: 27 passing across `tests/arena.ts` (program behaviour) and
+  `tests/arenaProgram.ts` (the shared program bindings, decoder and settlement).
 - **OpenFrontIO wager integration**: the full stake loop is wired — host creates the
   escrow, every player (host included) stakes into it. Working: `arena/auth.ts` +
   `client/arena/walletAuth.ts` (SIWS-style wallet signature), `matchRegistry`,
@@ -267,15 +267,34 @@ which is what it must now match.
   endpoint, wager info on `GET /api/game/:id`, the host's stake control in
   `HostLobbyModal.ts`), and **Stage 3** (`onchainJoin.ts`'s real `join_match`,
   `WagerLobby.ts` mounted through `arena/wagerJoinFlow.ts` from `Main.ts`'s join funnel,
-  wallet fields threaded `LobbyConfig` → `ClientJoinMessage`).
-  and **Stage 4** (`rpcClient.ts` reads and decodes the real `MatchAccount`).
-  Still broken: `settler.ts` (wrong digest format, never submits) — so a match can be
-  staked but **not yet paid out**.
+  wallet fields threaded `LobbyConfig` → `ClientJoinMessage`),
+  **Stage 4** (`rpcClient.ts` reads and decodes the real `MatchAccount`), and
+  **Stage 5** (`settler.ts` signs the correct digest and submits `settle_match`, or
+  `cancel_match` when the lobby never filled).
+- **The wager loop is closed end to end**: create escrow → stake → play → pay out.
+  What remains is Stage 6 (a dev-mode auth bypass so the path can be exercised locally)
+  and the open issues below.
 - Wagering is inert unless `ARENA_PROGRAM_ID` is set.
+- **Never run against mainnet in this state.** Beyond the client-vote risk below, none
+  of this has been exercised against a live cluster — every proof so far is bankrun.
 - **Dependencies**: `OpenFrontIO/package-lock.json` was out of sync with its
   `package.json` (arena scaffolding added `@solana/web3.js`/`tweetnacl` without locking
   them), so `npm ci` was impossible. Resolved with `npm install --ignore-scripts`.
   Use `npm run inst` from now on, per `OpenFrontIO/CLAUDE.md`.
+
+## ⚠️ A wagered lobby must fill, or it refunds
+`settle_match` only accepts a match in `InProgress`, and `join_match` sets that status
+only when `player_count` reaches `max_players`. A wagered lobby that starts with empty
+staked seats therefore **cannot be paid out at all** — the program will refuse it.
+
+`settler.ts` handles this by refunding every staker via `cancel_match` instead of
+leaving the pot in the vault, so no money is lost. But from a player's point of view the
+match was played and nobody won it, which is a poor experience.
+
+The operational rule is: **`maxPlayers` on the wager must equal the number of players
+who will actually play.** There is currently nothing in the lobby UI enforcing that the
+host waits for every staked seat before starting, which is worth closing before this is
+used for anything real.
 
 ## Task Queue — remaining work, in order
 Each stage is gated on `npx tsc --noEmit` (from `OpenFrontIO/`) before moving on.
@@ -348,11 +367,41 @@ Each stage is gated on `npx tsc --noEmit` (from `OpenFrontIO/`) before moving on
      behind would otherwise kick a player who genuinely paid.
    - It also refuses a `Settled`/`Cancelled` match, and refuses one whose on-chain
      `mint`/`vault`/`entry_fee` disagree with the registry entry.
-5. **`settler.ts`** — fix the digest to `sha256(matchPDA || winner || scores_u64_le)`;
-   rebuild standings from on-chain `players[]` order; build the Ed25519 instruction
-   (port `buildEd25519InstructionData` from `tests/arena.ts`) at index 0 plus the
-   `settle_match` instruction; submit. (`example.env` already carries the env vars as of
-   Stage 2.)
+5. ~~**`settler.ts`** — correct digest, standings from on-chain `players[]`, Ed25519
+   instruction at index 0, submission.~~ **DONE.** Notes:
+   - The digest is `sha256(matchPDA || winner || scores_u64_le)` — raw bytes, no
+     separators, no JSON. `settleMessagePreimage()` in `core/arena/arenaProgram.ts`
+     builds the preimage (pure, browser-safe); the caller hashes it, because sha256 has
+     no synchronous cross-realm implementation. A wrong preimage produces a perfectly
+     valid signature the program rejects, and the pot stays locked — so
+     `tests/arenaProgram.ts` executes a real settlement and asserts the token balances
+     moved, plus that the digest **binds the scores** (sign one vector, submit another →
+     rejected) and that a non-authority signature is refused.
+   - The ed25519 instruction is built with web3.js's `Ed25519Program`, not the
+     hand-rolled `buildEd25519InstructionData` from `tests/arena.ts`. Byte order inside
+     the payload differs from that helper (pubkey before signature), which does not
+     matter — the program reads the header offsets — and the canonical builder is less
+     likely to drift from what the runtime verifier expects.
+   - **`settle_match` requires `InProgress`, which only happens when the lobby fills.**
+     `join_match` flips `Open -> InProgress` at `player_count == max_players`. A wagered
+     lobby that plays out with empty seats can therefore never be settled. `settler.ts`
+     detects `Open` and **refunds via `cancel_match`** instead. Do not "fix" this by
+     relaxing the program's status check — the refund is the correct outcome.
+   - Failure paths deliberately leave the pot in escrow rather than guessing: unknown
+     winner, team win (the program pays exactly one wallet), a winner who did not stake.
+     Each logs; none submits.
+   - `settle_match`/`cancel_match` pay into accounts they do not create, and `join_match`
+     accepts any token account with the right owner and mint — so a staker may have no
+     canonical ATA. `ensureTokenAccount()` creates one first, in **its own transaction**
+     so it cannot push the settle tx over the size limit or disturb the
+     ed25519-at-index-0 requirement.
+   - `TREASURY_TOKEN_ACCOUNT` is only required when `ARENA_RAKE_BPS > 0`. At 0 bps the
+     program still wants the account but transfers nothing to it, so the winner's own
+     token account is passed. With rake > 0 and no treasury configured, settlement is
+     **refused** rather than sending the rake somewhere arbitrary.
+   - The old dev-mode short-circuit is gone. A registry entry always means a real
+     on-chain escrow, so skipping submission in dev would not avoid touching the chain —
+     it would strand real tokens.
 6. **Dev-mode auth bypass** — `Worker.ts`'s wagered-join gate requires a `jti` claim
    with no dev bypass, while the on-chain check right beside it *does* bypass in dev.
    Local/anonymous dev sessions never have a `jti`, so the wagered path is currently
@@ -366,9 +415,9 @@ Each stage is gated on `npx tsc --noEmit` (from `OpenFrontIO/`) before moving on
 - Checks before declaring done:
   - Program: from WSL, `anchor build && anchor test --skip-deploy --skip-local-validator`
   - Game: from `OpenFrontIO/`, `npx tsc --noEmit` and `npm run lint`
-  - Current `OpenFrontIO` tsc baseline is **2 pre-existing errors**
-    (`arena/settler.ts` possibly-undefined, `GameServer.ts` null-assignability). Both
-    are fixed by Stage 5. Any count above 2 means you introduced something.
+  - `OpenFrontIO` tsc is **clean — zero errors**. It carried 2 pre-existing errors
+    until Stage 5 (`arena/settler.ts` possibly-undefined, `GameServer.ts`
+    null-assignability); both are gone. Any error at all now means you introduced it.
   - `npm run lint` must be **clean** — it is, as of Stage 2. Run
     `npx prettier --write` on changed files too; lint does not cover formatting, and the
     repo's prettier config reorders imports.

@@ -33,6 +33,7 @@ import { startAnchor } from "anchor-bankrun";
 import { ProgramTestContext } from "solana-bankrun";
 import { assert } from "chai";
 import { createHash } from "crypto";
+import nacl from "tweetnacl";
 
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID as ARENA_ATA_PROGRAM_ID,
@@ -44,12 +45,17 @@ import {
   MAX_RAKE_BPS,
   MatchStatus,
   TOKEN_PROGRAM_ID as ARENA_TOKEN_PROGRAM_ID,
+  buildCancelMatchIx,
+  buildCreateAtaIdempotentIx,
   buildCreateMatchIx,
+  buildEd25519VerifyIx,
   buildJoinMatchIx,
+  buildSettleMatchIx,
   decodeMatchAccount,
   deriveAta,
   deriveMatchPda,
   deriveVaultAta,
+  settleMessagePreimage,
 } from "../OpenFrontIO/src/core/arena/arenaProgram";
 
 import idlJson from "../target/idl/arena.json";
@@ -219,6 +225,38 @@ describe("arenaProgram bindings", () => {
       // No amount arg on purpose: the program transfers match_account.entry_fee
       // read from chain state, so a client cannot understake by lying.
       assert.deepEqual(ix.args, []);
+    });
+
+    it("settle_match account order and arg order match the IDL", () => {
+      const ix = idl.instructions.find((i) => i.name === "settle_match")!;
+      assert.deepEqual(
+        ix.accounts.map((a) => a.name),
+        [
+          "match_account",
+          "vault",
+          "winner_token",
+          "treasury_token",
+          "sysvar_instructions",
+          "token_program",
+        ],
+      );
+      assert.deepEqual(
+        ix.args.map((a) => a.name),
+        ["winner", "scores"],
+      );
+      // No Signer account: the server authorises through the ed25519 prelude
+      // instruction, not by signing this one.
+      assert.isUndefined(ix.accounts.find((a) => a.signer === true));
+    });
+
+    it("cancel_match account order matches the IDL", () => {
+      const ix = idl.instructions.find((i) => i.name === "cancel_match")!;
+      assert.deepEqual(
+        ix.accounts.map((a) => a.name),
+        ["authority", "match_account", "vault", "token_program"],
+      );
+      assert.deepEqual(ix.args, []);
+      assert.isTrue(ix.accounts[0].signer, "authority must sign a cancel");
     });
 
     it("MatchStatus discriminants follow the IDL variant order", () => {
@@ -571,6 +609,361 @@ describe("arenaProgram bindings", () => {
         () => buildCreateMatchIx({ ...base, entryFee: -1n }),
         /u64 out of range/,
       );
+    });
+  });
+
+  // Settlement is the point at which the pot actually moves, so the digest
+  // format and the instruction layout are proven end to end here rather than
+  // inferred. The failure this guards against is silent: a wrong preimage
+  // produces a perfectly valid signature that the program rejects, and the pot
+  // stays locked in the vault with no second chance to sign it correctly.
+  describe("settlement, executed against the program in bankrun", () => {
+    let context: ProgramTestContext;
+    const programId = new PublicKey(idl.address);
+    const authority = Keypair.generate();
+    const mintKp = Keypair.generate();
+    const treasuryOwner = Keypair.generate();
+
+    const ENTRY_FEE = 1_000_000n;
+    const RAKE_BPS = 250; // 2.5%
+    const SETTLE_NONCE = 0x1122334455667788n;
+    const CANCEL_NONCE = 0x99aabbccddeeff00n;
+
+    let treasuryToken: PublicKey;
+
+    async function sendTx(ixs: TransactionInstruction[], signers: Keypair[]) {
+      const tx = new Transaction();
+      tx.recentBlockhash = context.lastBlockhash;
+      tx.feePayer = signers[0].publicKey;
+      tx.add(...ixs);
+      tx.sign(...signers);
+      await context.banksClient.processTransaction(tx);
+    }
+
+    async function assertTxFails(
+      ixs: TransactionInstruction[],
+      signers: Keypair[],
+    ) {
+      let threw = false;
+      try {
+        await sendTx(ixs, signers);
+      } catch {
+        threw = true;
+      }
+      assert.isTrue(threw, "expected the program to reject this transaction");
+    }
+
+    before(async () => {
+      context = await startAnchor(
+        ".",
+        [],
+        [
+          {
+            address: authority.publicKey,
+            info: {
+              lamports: 100_000_000_000,
+              data: Buffer.alloc(0),
+              owner: SystemProgram.programId,
+              executable: false,
+            },
+          },
+        ],
+      );
+
+      const rent = await context.banksClient.getRent();
+      await sendTx(
+        [
+          SystemProgram.createAccount({
+            fromPubkey: authority.publicKey,
+            newAccountPubkey: mintKp.publicKey,
+            space: MINT_SIZE,
+            lamports: Number(rent.minimumBalance(BigInt(MINT_SIZE))),
+            programId: TOKEN_PROGRAM_ID,
+          }),
+          createInitializeMint2Instruction(
+            mintKp.publicKey,
+            0,
+            authority.publicKey,
+            null,
+          ),
+        ],
+        [authority, mintKp],
+      );
+
+      treasuryToken = deriveAta(treasuryOwner.publicKey, mintKp.publicKey);
+      await sendTx(
+        [
+          buildCreateAtaIdempotentIx(
+            authority.publicKey,
+            treasuryOwner.publicKey,
+            mintKp.publicKey,
+          ),
+        ],
+        [authority],
+      );
+    });
+
+    /** A funded wallet holding exactly one entry fee in its ATA. */
+    async function fundedPlayer(): Promise<{ kp: Keypair; token: PublicKey }> {
+      const kp = Keypair.generate();
+      context.setAccount(kp.publicKey, {
+        lamports: 10_000_000_000,
+        data: Buffer.alloc(0),
+        owner: SystemProgram.programId,
+        executable: false,
+      });
+      const token = deriveAta(kp.publicKey, mintKp.publicKey);
+      await sendTx(
+        [
+          buildCreateAtaIdempotentIx(
+            kp.publicKey,
+            kp.publicKey,
+            mintKp.publicKey,
+          ),
+          createMintToInstruction(
+            mintKp.publicKey,
+            token,
+            authority.publicKey,
+            ENTRY_FEE,
+          ),
+        ],
+        [kp, authority],
+      );
+      return { kp, token };
+    }
+
+    /** create_match plus enough joins to fill it, so status becomes InProgress. */
+    async function filledMatch(nonce: bigint, seats: number) {
+      const { ix, matchPda, vault } = buildCreateMatchIx({
+        programId,
+        authority: authority.publicKey,
+        mint: mintKp.publicKey,
+        entryFee: ENTRY_FEE,
+        maxPlayers: seats,
+        rakeBps: RAKE_BPS,
+        nonce,
+      });
+      await sendTx([ix], [authority]);
+
+      const players: { kp: Keypair; token: PublicKey }[] = [];
+      for (let i = 0; i < seats; i++) {
+        const player = await fundedPlayer();
+        await sendTx(
+          [
+            buildJoinMatchIx({
+              programId,
+              player: player.kp.publicKey,
+              matchPda,
+              vault,
+              playerToken: player.token,
+            }),
+          ],
+          [player.kp],
+        );
+        players.push(player);
+      }
+      return { matchPda, vault, players };
+    }
+
+    async function readMatch(matchPda: PublicKey) {
+      const raw = await context.banksClient.getAccount(matchPda);
+      return decodeMatchAccount(
+        Uint8Array.from(raw!.data),
+        new PublicKey(raw!.owner),
+        programId,
+      );
+    }
+
+    async function tokenBalance(account: PublicKey): Promise<bigint> {
+      const raw = await context.banksClient.getAccount(account);
+      return Buffer.from(raw!.data).readBigUInt64LE(64);
+    }
+
+    /** Exactly what settler.ts signs: sha256 over settleMessagePreimage. */
+    function settleDigest(
+      matchPda: PublicKey,
+      winner: PublicKey,
+      scores: bigint[],
+    ): Buffer {
+      return createHash("sha256")
+        .update(settleMessagePreimage(matchPda, winner, scores))
+        .digest();
+    }
+
+    it("settle_match pays the winner and the treasury from a signed digest", async () => {
+      const { matchPda, vault, players } = await filledMatch(SETTLE_NONCE, 2);
+
+      const match = await readMatch(matchPda);
+      assert.equal(
+        match.status,
+        MatchStatus.InProgress,
+        "a full match should be InProgress before settlement",
+      );
+
+      // Positional against players[] in join order — the same vector
+      // settler.ts rebuilds from chain state.
+      const scores = [500n, 250n];
+      const winner = match.players[0];
+      const winnerToken = deriveAta(winner, mintKp.publicKey);
+
+      const digest = settleDigest(matchPda, winner, scores);
+      const signature = nacl.sign.detached(digest, authority.secretKey);
+
+      const pot = await tokenBalance(vault);
+      assert.equal(pot, ENTRY_FEE * 2n, "vault should hold both stakes");
+
+      await sendTx(
+        [
+          // Index 0 is load-bearing: settle_match reads instruction 0 out of
+          // the instructions sysvar and rejects anything that is not this.
+          buildEd25519VerifyIx(
+            authority.publicKey.toBytes(),
+            signature,
+            digest,
+          ),
+          buildSettleMatchIx({
+            programId,
+            matchPda,
+            vault,
+            winnerToken,
+            treasuryToken,
+            winner,
+            scores,
+          }),
+        ],
+        [authority],
+      );
+
+      const expectedRake = (pot * BigInt(RAKE_BPS)) / 10_000n;
+      assert.equal(await tokenBalance(winnerToken), pot - expectedRake);
+      assert.equal(await tokenBalance(treasuryToken), expectedRake);
+      assert.equal(await tokenBalance(vault), 0n, "vault should be drained");
+      assert.equal((await readMatch(matchPda)).status, MatchStatus.Settled);
+      // The loser staked and got nothing back. That is the wager working.
+      assert.equal(await tokenBalance(players[1].token), 0n);
+    });
+
+    it("the signed digest binds the scores, not just the winner", async () => {
+      const { matchPda, vault } = await filledMatch(SETTLE_NONCE + 1n, 2);
+      const winner = (await readMatch(matchPda)).players[0];
+
+      // Sign one set of scores, submit another. The digest before Stage 5
+      // hashed a JSON string of a server-side ordering, which would not have
+      // bound these bytes at all: the standings recorded on-chain could differ
+      // from the ones anybody actually signed.
+      const digest = settleDigest(matchPda, winner, [500n, 250n]);
+      const signature = nacl.sign.detached(digest, authority.secretKey);
+
+      await assertTxFails(
+        [
+          buildEd25519VerifyIx(
+            authority.publicKey.toBytes(),
+            signature,
+            digest,
+          ),
+          buildSettleMatchIx({
+            programId,
+            matchPda,
+            vault,
+            winnerToken: deriveAta(winner, mintKp.publicKey),
+            treasuryToken,
+            winner,
+            scores: [250n, 500n],
+          }),
+        ],
+        [authority],
+      );
+    });
+
+    it("settle_match rejects a digest signed by anyone but the authority", async () => {
+      const { matchPda, vault } = await filledMatch(SETTLE_NONCE + 2n, 2);
+      const winner = (await readMatch(matchPda)).players[0];
+      const scores = [1n, 2n];
+
+      // A perfectly valid ed25519 signature over the correct digest. The
+      // program still refuses it, because the key is not match.authority.
+      const impostor = Keypair.generate();
+      const digest = settleDigest(matchPda, winner, scores);
+      const signature = nacl.sign.detached(digest, impostor.secretKey);
+
+      await assertTxFails(
+        [
+          buildEd25519VerifyIx(impostor.publicKey.toBytes(), signature, digest),
+          buildSettleMatchIx({
+            programId,
+            matchPda,
+            vault,
+            winnerToken: deriveAta(winner, mintKp.publicKey),
+            treasuryToken,
+            winner,
+            scores,
+          }),
+        ],
+        [authority],
+      );
+    });
+
+    it("cancel_match refunds every staker in players[] order", async () => {
+      // Three seats, two joins: the match never fills, so it stays Open and
+      // settle_match would refuse it outright. This is the case settler.ts
+      // resolves by refunding rather than leaving the pot locked.
+      const { ix, matchPda, vault } = buildCreateMatchIx({
+        programId,
+        authority: authority.publicKey,
+        mint: mintKp.publicKey,
+        entryFee: ENTRY_FEE,
+        maxPlayers: 3,
+        rakeBps: RAKE_BPS,
+        nonce: CANCEL_NONCE,
+      });
+      await sendTx([ix], [authority]);
+
+      const joined: { kp: Keypair; token: PublicKey }[] = [];
+      for (let i = 0; i < 2; i++) {
+        const player = await fundedPlayer();
+        await sendTx(
+          [
+            buildJoinMatchIx({
+              programId,
+              player: player.kp.publicKey,
+              matchPda,
+              vault,
+              playerToken: player.token,
+            }),
+          ],
+          [player.kp],
+        );
+        joined.push(player);
+      }
+
+      const match = await readMatch(matchPda);
+      assert.equal(match.status, MatchStatus.Open, "2 of 3 seats: still Open");
+      assert.equal(await tokenBalance(vault), ENTRY_FEE * 2n);
+
+      await sendTx(
+        [
+          buildCancelMatchIx({
+            programId,
+            authority: authority.publicKey,
+            matchPda,
+            vault,
+            refundTokenAccounts: match.players.map((p) =>
+              deriveAta(p, mintKp.publicKey),
+            ),
+          }),
+        ],
+        [authority],
+      );
+
+      assert.equal(await tokenBalance(vault), 0n);
+      for (const player of joined) {
+        assert.equal(
+          await tokenBalance(player.token),
+          ENTRY_FEE,
+          "every staker should be made whole",
+        );
+      }
+      assert.equal((await readMatch(matchPda)).status, MatchStatus.Cancelled);
     });
   });
 });
