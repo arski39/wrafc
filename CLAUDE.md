@@ -259,8 +259,9 @@ which is what it must now match.
   toolchain above; `arena.so` + IDL + types are generated.
 - **Tests**: 27 passing on the program side (`tests/arena.ts` for behaviour,
   `tests/arenaProgram.ts` for the shared bindings, decoder and settlement), and
-  3279 passing on the game side (`npm test` from `OpenFrontIO/`, including
-  `tests/ArenaWalletAuth.test.ts` and `tests/server/ArenaStartGate.test.ts`).
+  3301 passing on the game side (`npm test` from `OpenFrontIO/`, including
+  `tests/ArenaWalletAuth.test.ts`, `tests/server/ArenaStartGate.test.ts` and
+  `tests/server/AppShellBranding.test.ts`).
 - **OpenFrontIO wager integration**: the full stake loop is wired — host creates the
   escrow, every player (host included) stakes into it. Working: `arena/auth.ts` +
   `client/arena/walletAuth.ts` (SIWS-style wallet signature), `matchRegistry`,
@@ -474,6 +475,37 @@ Two things will otherwise waste an afternoon:
   `ARENA_PROGRAM_ID` set. With `ARENA_PROGRAM_ID` empty the host UI hides the stake
   control and every lobby stays free — which is the correct default, not a failure.
 
+## Hosting this fork — three licences, and none of them are optional
+Landed in Phase H5 (`OpenFrontIO` `8a9ab4d`). Details in
+`OpenFrontIO/docs/branding.md`; the short version, because each of these is easy
+to silently undo:
+
+- **`proprietary/` must stay empty.** It held OpenFront's wordmark, logos,
+  favicon, `OpenFront.ttf` and the background music, all *All Rights Reserved* and
+  explicitly not redistributable. The directory and the build plumbing remain so a
+  licensed copy can be restored — but do not restore the assets, and reject any
+  upstream merge that re-adds them. `listHashedPublicAssetPaths` skips a missing
+  source dir, so nothing breaks without them; the font and music failures are
+  already caught (`Main.ts`'s `FontFace` catch, `SoundManager`'s `safely()`).
+- **Do not reinstate upstream's analytics.** `index.html` used to carry
+  OpenFront's own Google Ads and GA4 properties. In a fork those report your
+  traffic into their accounts. `tests/server/AppShellBranding.test.ts` asserts
+  their absence precisely because `index.html` is a merge target.
+- **AGPL v3 §13 is the load-bearing one.** Offering a modified version over a
+  network obliges you to offer its users *that version's* source. The mechanism is
+  the footer link, driven by `SOURCE_REPO_URL`. Unset means the footer points at
+  upstream, which is only honest for an unmodified build.
+- **§7 additional terms cut both ways:** preserve copyright notices (so
+  `CREDITS.md`, the upstream links and `proprietary/LICENSE` stay), but do not
+  present this as official OpenFront (so the name, logo and page title must
+  change). The page title is still `OpenFront (ALPHA)` — it is a Crowdin-managed
+  string in `en.json`, so it waits on the name.
+
+`index.html` is EJS rendered only at request time, so a variable the server
+forgets to pass is a **production `ReferenceError` that tsc and lint cannot see**.
+`AppShellBranding.test.ts` is the only thing that renders the template — extend it
+when you add a template variable.
+
 ## Conventions
 - Commits: conventional commits (`feat(arena):`, `fix(program):`, …).
 - Inside `OpenFrontIO/`, mark every edit to a pre-existing upstream file with an
@@ -511,6 +543,10 @@ Two things will otherwise waste an afternoon:
   embeds an API key, because this value is served to every player.
 - `ARENA_RAKE_BPS` — house cut, 0..1000. Operator-set, never host-set.
 - `TREASURY_TOKEN_ACCOUNT` — rake destination token account (needed once rake > 0)
+- `SITE_NAME` — public display name, used for `og:title`. Falls back to `DOMAIN`.
+- `SOURCE_REPO_URL` — where **this** deployment's source lives. Drives the footer
+  link. **Unset is an AGPL problem, not a cosmetic one** — see below. The master
+  logs a warning at boot outside dev.
 - Existing OpenFront vars (`GAME_ENV`, `API_KEY`, `DOMAIN`, …) — see its `example.env`
 
 **Ops requirement:** the server keypair needs a funded SOL balance to pay rent for each
