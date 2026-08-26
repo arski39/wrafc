@@ -262,9 +262,9 @@ which is what it must now match.
   toolchain above; `arena.so` + IDL + types are generated.
 - **Tests**: 31 passing on the program side (`tests/arena.ts` for behaviour,
   `tests/arenaProgram.ts` for the shared bindings, decoder and settlement), and
-  3301 passing on the game side (`npm test` from `OpenFrontIO/`, including
-  `tests/ArenaWalletAuth.test.ts`, `tests/server/ArenaStartGate.test.ts` and
-  `tests/server/AppShellBranding.test.ts`).
+  3342 passing on the game side (`npm test` from `OpenFrontIO/`, including
+  `tests/ArenaWalletAuth.test.ts`, `tests/server/ArenaStartGate.test.ts`,
+  `tests/server/AppShellBranding.test.ts` and `tests/server/ArenaDevBypass.test.ts`).
 - **OpenFrontIO wager integration**: the full stake loop is wired — host creates the
   escrow, every player (host included) stakes into it. Working: `arena/auth.ts` +
   `client/arena/walletAuth.ts` (SIWS-style wallet signature), `matchRegistry`,
@@ -347,7 +347,7 @@ dependency order:
 | Phase | What | State |
 |---|---|---|
 | **1** | Wagered start-gate + refund the unstartable | ✅ root `a283bfc`, ofio `c76ed24` |
-| **2** | `ARENA_DEV_BYPASS` containment — dev must not move real tokens | **blocked on two decisions** (see below) |
+| **2** | `ARENA_DEV_BYPASS` containment + stake cap | ✅ ofio `cecbe4b` |
 | **H5** | Stop shipping upstream's identity (licensing) | ✅ ofio `8a9ab4d` |
 | **H3** | Program: timeout-cancel for a stranded `InProgress` match | ✅ root `552425c` |
 | **H1** | Arena env vars + keypair mount through the deploy path | todo |
@@ -357,11 +357,47 @@ dependency order:
 | **3** | Devnet deploy + live validation (S1–S7) | needs H3 first |
 | **4** | Server-side replay winner determination | **mainnet gate** |
 
-**Open decisions** blocking Phase 2: whether bypass-on + non-devnet RPC should
-refuse to boot or only warn; and whether the client learns the bypass state from
-`GET /api/game/:id` or is left to be rejected by the server.
+**H1 is the next unblocked item.** H2's sweeper needs it; H6 needs the domain.
 
-**H1 is the next unblocked item.** H2's sweeper needs it, and H4/H6 need inputs.
+### Phase 2 — the dev bypass is opt-in *and* cluster-gated (done)
+Two bypasses used to fire on `GameEnv.Dev` alone — the `jti`-nonce fallback in
+`walletAuthNonce` and the on-chain stake check in `Worker.ts`. Together they let a
+player hold a wagered seat without paying, which fills the escrow to `InProgress`
+with a partial pot that then settles and pays out. With `ARENA_PROGRAM_ID` pointed
+anywhere real, that was dev mode moving real tokens.
+
+`arena/devBypass.ts` is now the single predicate. Notes:
+- **`ARENA_DEV_BYPASS=true` is necessary but not sufficient.** `resolveDevBypass()`
+  also asks the cluster for its **genesis hash** and refuses mainnet-beta. The URL
+  proves nothing — a provider endpoint need not contain "devnet", a proxy can hide
+  it, and a typo'd variable pointing at mainnet reads as ordinary text.
+- **Everything fails closed.** `devBypassEnabled()` reads false until resolution
+  succeeds, so not-requested, mainnet, unreachable RPC and never-resolved all land
+  on the strict path. This costs nothing in production: the check only runs when
+  the bypass was requested, so a flaky RPC can never affect a server that never
+  asked. That is why this is *not* a refuse-to-boot check — that would trade a real
+  availability risk for no extra safety.
+- **Unknown genesis is allowed on purpose.** `solana-test-validator` mints a fresh
+  one every start; refusing it would make the bypass useless for its main case.
+- **The client is told the resolved answer** via `BOOTSTRAP_CONFIG` →
+  `ClientEnv.arenaDevBypass()`, not left to infer it from its own `GameEnv`. A dev
+  client that assumed dev-implies-bypass would prompt the wallet and then have the
+  server reject the signature — Stage 6's rule is to refuse *before* prompting.
+- **`resolveDevBypass()` runs in both the master and every worker.** Module state is
+  per-process, and the master needs it too because it renders the app shell.
+
+### `ARENA_MAX_ENTRY_FEE` — the stake cap that did not exist
+The accepted-risk section below says not to raise stake limits while the winner is
+client-voted. There was no limit to raise: `POST /:id/wager` accepted any non-zero
+u64, and the program bounds `rake_bps` and `max_players` but leaves `entry_fee`
+unbounded. Same shape as the Phase 1 start-gate — a documented rule with nothing
+behind it.
+
+Server-side rather than on-chain because it is **policy, not fund safety**: the
+escrow is equally sound at any stake, and a compiled-in constant cannot be
+denominated without the mint's decimals. A malformed value **throws** rather than
+defaulting to "no cap" — a typo'd ceiling that silently means unlimited is exactly
+the failure being prevented.
 
 ### H3 — the `InProgress` escape hatch (done, and why it matters)
 `settle_match` accepts only `InProgress`; `cancel_match` used to accept only
@@ -599,6 +635,11 @@ when you add a template variable.
   embeds an API key, because this value is served to every player.
 - `ARENA_RAKE_BPS` — house cut, 0..1000. Operator-set, never host-set.
 - `TREASURY_TOKEN_ACCOUNT` — rake destination token account (needed once rake > 0)
+- `ARENA_DEV_BYPASS` — **dev only, default off.** Skips the wallet-signature session
+  binding and the on-chain stake check. Only honoured when `GAME_ENV=dev` **and** the
+  cluster's genesis hash proves it is not mainnet; refused if the RPC is unreachable.
+- `ARENA_MAX_ENTRY_FEE` — ceiling on one seat's stake, in token base units. Empty
+  means no ceiling. Operator-set, never host-set.
 - `SITE_NAME` — public display name, used for `og:title`. Falls back to `DOMAIN`.
 - `SOURCE_REPO_URL` — where **this** deployment's source lives. Drives the footer
   link. **Unset is an AGPL problem, not a cosmetic one** — see below. The master

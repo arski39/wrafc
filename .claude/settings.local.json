@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "PowerShell(uv tool run --from graphifyy python -c \"import sys; print\\(sys.executable\\)\" 2>&1)",
-      "PowerShell(uv tool list 2>&1)"
+      "PowerShell(uv tool list 2>&1)",
+      "Bash(python -)"
     ]
   }
 }
