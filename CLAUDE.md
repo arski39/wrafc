@@ -100,28 +100,28 @@ A `Cargo.lock` is now committed. Keep it committed.
 ## Status of on-chain verification — ✅ GREEN
 - `anchor build` passes. Produces `target/deploy/arena.so`, `target/idl/arena.json`
   (all four instructions incl. `cancel_match`, 10 errors), `target/types/arena.ts`.
-- `anchor test --skip-deploy --skip-local-validator` — **17 passing, 0 failing.**
+- `anchor test --skip-deploy --skip-local-validator` — **19 passing, 0 failing.**
   - `tests/arena.ts` (7): happy path, rake math, double-join rejected, bad-signature
     rejected, plus the three `cancel_match` tests (refund, non-authority rejected,
     already-started rejected).
-  - `tests/arenaProgram.ts` (10): pins the game server's hand-rolled program bindings
-    (`OpenFrontIO/src/server/arena/arenaProgram.ts`) — see below.
+  - `tests/arenaProgram.ts` (12): pins the hand-rolled program bindings
+    (`OpenFrontIO/src/core/arena/arenaProgram.ts`) — see below.
 
 Use `--skip-deploy --skip-local-validator`. Plain `anchor test` fails: `--skip-local-validator`
 alone still tries to *deploy* to `127.0.0.1:8899`, and these tests need no validator —
 bankrun runs an in-process SVM and loads `target/deploy/arena.so` directly.
 
-### `tests/arenaProgram.ts` — why the game server has no Anchor client
-The game server builds arena instructions **byte by byte** rather than through
-`@coral-xyz/anchor`: the same module ships to the browser for the client-side
-`join_match`, and Anchor's coder is a large bundle for four instructions. The cost is
-constants that can silently drift from the program, so that suite pins both ends:
+### `tests/arenaProgram.ts` — why there is no Anchor client
+Arena instructions are built **byte by byte** rather than through `@coral-xyz/anchor`:
+the same module ships to the browser for the client-side `join_match`, and Anchor's
+coder is a large bundle for four instructions. The cost is constants that can silently
+drift from the program, so that suite pins both ends:
 
 1. every discriminator, field offset, account order and arg order is **diffed against
    the generated `target/idl/arena.json`**, and
-2. the `create_match` instruction the server would actually send is **executed against
-   the real program in bankrun**, then the resulting account is decoded back through the
-   same offset table.
+2. the `create_match` and `join_match` instructions that would actually be sent are
+   **executed against the real program in bankrun**, then the resulting account is
+   decoded back through the same offset table.
 
 Either half alone is insufficient — (1) would pass against a stale IDL, (2) would pass on
 a layout that merely round-trips. Keep both when adding an instruction.
@@ -135,8 +135,12 @@ that they match the IDL and that they are *not* the camelCase hash.
 
 Note the root test imports across into `OpenFrontIO/` (which root `tsconfig.json`
 excludes — `exclude` only filters the `include` globs, imported files still compile).
-That works only because `arenaProgram.ts` imports nothing but `@solana/web3.js`. **Keep
-it free of Node built-ins and of OpenFrontIO imports** or the root suite stops building.
+That works only because `arenaProgram.ts` imports nothing but `@solana/web3.js` and
+`buffer`. **Keep it free of OpenFrontIO imports** or the root suite stops building, and
+**free of Node built-ins** or the browser bundle breaks at runtime. `buffer` is the one
+allowed exception: Node prefers its own builtin for that bare specifier while bundlers
+resolve the npm package, so it works in both realms — unlike the bare `Buffer` global,
+which type-checks via `@types/node` and is simply `undefined` in a browser.
 
 ### Test-suite gotchas (all cost real debugging time — don't reintroduce)
 - **Never use `@solana/spl-token`'s action helpers** (`createMint`, `mintTo`,
@@ -251,20 +255,21 @@ which is what it must now match.
   `create_match` (vault is a real PDA-owned ATA), `join_match`, `settle_match`
   (on-chain ed25519 verified), `cancel_match` (ported, hardened). **Compiles** under the
   toolchain above; `arena.so` + IDL + types are generated.
-- **Tests**: 17 passing across `tests/arena.ts` (program behaviour) and
-  `tests/arenaProgram.ts` (the game server's bindings).
-- **OpenFrontIO wager integration**: the host half is live; the joining-player half is
-  not. Working: `arena/auth.ts` + `client/arena/walletAuth.ts` (SIWS-style wallet
-  signature), `matchRegistry`, `walletRegistry`, the wagered-join gate in `Worker.ts`,
-  and **Stage 2** — `arenaProgram.ts` bindings, a real `create_match` from
-  `matchCreator.ts`, the creator-only `POST /api/game/:id/wager` endpoint, wager info on
-  `GET /api/game/:id`, and the host's stake control in `HostLobbyModal.ts`.
-  Still stubbed/broken: `onchainJoin.ts` (returns undefined), `rpcClient.ts` (checks a tx
-  signature, never reads `MatchAccount.players[]`), `settler.ts` (wrong digest format,
-  never submits). `WagerLobby.ts` is fully built but never mounted and omits `walletSig`.
-- **A wagered lobby cannot be completed yet.** The escrow is created, but nobody can
-  stake into it until Stage 3 lands `join_match`, and the join gate will reject every
-  player until then. Wagering is inert unless `ARENA_PROGRAM_ID` is set.
+- **Tests**: 19 passing across `tests/arena.ts` (program behaviour) and
+  `tests/arenaProgram.ts` (the shared program bindings).
+- **OpenFrontIO wager integration**: the full stake loop is wired — host creates the
+  escrow, every player (host included) stakes into it. Working: `arena/auth.ts` +
+  `client/arena/walletAuth.ts` (SIWS-style wallet signature), `matchRegistry`,
+  `walletRegistry`, the wagered-join gate in `Worker.ts`, **Stage 2** (a real
+  `create_match` from `matchCreator.ts`, the creator-only `POST /api/game/:id/wager`
+  endpoint, wager info on `GET /api/game/:id`, the host's stake control in
+  `HostLobbyModal.ts`), and **Stage 3** (`onchainJoin.ts`'s real `join_match`,
+  `WagerLobby.ts` mounted through `arena/wagerJoinFlow.ts` from `Main.ts`'s join funnel,
+  wallet fields threaded `LobbyConfig` → `ClientJoinMessage`).
+  Still broken: `rpcClient.ts` (checks a tx signature, never reads
+  `MatchAccount.players[]`), `settler.ts` (wrong digest format, never submits) — so a
+  match can be staked but **not yet paid out**.
+- Wagering is inert unless `ARENA_PROGRAM_ID` is set.
 - **Dependencies**: `OpenFrontIO/package-lock.json` was out of sync with its
   `package.json` (arena scaffolding added `@solana/web3.js`/`tweetnacl` without locking
   them), so `npm ci` was impossible. Resolved with `npm install --ignore-scripts`.
@@ -275,7 +280,7 @@ Each stage is gated on `npx tsc --noEmit` (from `OpenFrontIO/`) before moving on
 
 2. ~~**`matchCreator.ts`** — real `create_match` submission + `POST /api/game/:id/wager`
    + wager info on `GET /api/game/:id` + host UI.~~ **DONE.** Notes for later stages:
-   - Bindings live in `OpenFrontIO/src/server/arena/arenaProgram.ts`; add `join_match`
+   - Bindings live in `OpenFrontIO/src/core/arena/arenaProgram.ts`; add `join_match`
      and `settle_match` builders there and extend `tests/arenaProgram.ts` alongside.
      `MATCH_ACCOUNT_LAYOUT` there is what Stage 4 should decode with.
    - The `nonce` seed is `sha256(gameId)[0..8]` read LE, so a match PDA is re-derivable
@@ -289,11 +294,32 @@ Each stage is gated on `npx tsc --noEmit` (from `OpenFrontIO/`) before moving on
      listed lobby and `/listing` rejects a wagered one.
    - `settler.ts`'s duplicate keypair loader was removed in favour of
      `arena/serverKeypair.ts`, which is now the single place the authority key is read.
-3. **Client on-chain join** — implement `onchainJoin.ts`'s `join_match` submission; fix
-   `WagerLobby.ts` to also call `signAuthMessage()` and emit `walletSig`; mount the
-   wager step in `Main.ts`'s `handleJoinLobby()`; thread
-   `{walletAddress, walletSig, onchainTxSig}` through `ClientGameRunner`'s `LobbyConfig`
-   into `Transport.joinGame()`'s `ClientJoinMessage`.
+3. ~~**Client on-chain join** — `onchainJoin.ts`'s `join_match` submission;
+   `WagerLobby.ts` signing + `walletSig`; mounting the wager step in `Main.ts`; threading
+   the wallet fields into `ClientJoinMessage`.~~ **DONE.** Notes for later stages:
+   - `arenaProgram.ts` **moved to `OpenFrontIO/src/core/arena/`**. It ships to the
+     browser now, and nothing under `src/client/` may import from `src/server/`. It also
+     gained `import { Buffer } from "buffer"` — the bare `Buffer` global is Node-only and
+     was a latent runtime break in the browser (the same bug was fixed in
+     `walletAuth.ts`, which had `Buffer.from(sig).toString("base64")`).
+   - The client stake gate is **dynamically imported** in `Main.ts`
+     (`await import("./arena/wagerJoinFlow")`). Static-importing it put
+     `@solana/web3.js` — 294 kB / 86 kB gzipped — in the main chunk for every player,
+     wagered or not. Keep it lazy; verify with `npx vite build` that
+     `wagerJoinFlow-*.js` is still a separate chunk.
+   - `WagerInfo` gained `programId` and `rpcUrl`, because the joining browser builds and
+     submits its own transaction. `programId` is stored **per-match** in `WagerConfig`,
+     not read from config at join time: repointing `ARENA_PROGRAM_ID` must not send a
+     stake to a different program than the one holding the pot.
+   - **The host must stake too.** `create_match` does not enrol the authority as a
+     player. The host's `join-lobby` fires when the lobby view opens, before any escrow
+     exists, so `HostLobbyModal.handleAttachWager` **re-dispatches `join-lobby`** on
+     success to send the host back through the gate. `POST /wager` correspondingly
+     rejects a lobby with more than one client connected (`wager_lobby_not_empty`) —
+     anyone who joined before the escrow existed got in unstaked and cannot be made to
+     stake retroactively.
+   - `Main.ts` runs the gate **before** tearing down the existing lobby handle, so
+     backing out of the stake prompt does not leave the player disconnected.
 4. **`rpcClient.ts`** — replace the tx-signature check with a real `MatchAccount`
    fetch + fixed-offset decode + `players[0..player_count]` scan.
 5. **`settler.ts`** — fix the digest to `sha256(matchPDA || winner || scores_u64_le)`;
@@ -334,6 +360,9 @@ Each stage is gated on `npx tsc --noEmit` (from `OpenFrontIO/`) before moving on
   one place, `arena/serverKeypair.ts` — don't add a second loader.
 - `ARENA_PROGRAM_ID` — deployed program id. **Leaving it empty disables wagering
   entirely**: the host UI hides the stake control and every lobby stays free to play.
+- `ARENA_PUBLIC_RPC_URL` — RPC endpoint handed to **joining browsers**, which submit
+  their own `join_match`. Falls back to `SOLANA_RPC_URL`; set it separately if that one
+  embeds an API key, because this value is served to every player.
 - `ARENA_RAKE_BPS` — house cut, 0..1000. Operator-set, never host-set.
 - `TREASURY_TOKEN_ACCOUNT` — rake destination token account (needed once rake > 0)
 - Existing OpenFront vars (`GAME_ENV`, `API_KEY`, `DOMAIN`, …) — see its `example.env`

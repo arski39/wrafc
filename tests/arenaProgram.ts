@@ -1,4 +1,4 @@
-// Proves the hand-rolled bindings in OpenFrontIO/src/server/arena/arenaProgram.ts.
+// Proves the hand-rolled bindings in OpenFrontIO/src/core/arena/arenaProgram.ts.
 //
 // The game server does not use @coral-xyz/anchor — it builds arena instructions
 // byte by byte so the browser half of the wager flow stays small. That trades a
@@ -24,7 +24,9 @@ import {
 import {
   MINT_SIZE,
   TOKEN_PROGRAM_ID,
+  createAssociatedTokenAccountInstruction,
   createInitializeMint2Instruction,
+  createMintToInstruction,
 } from "@solana/spl-token";
 import { startAnchor } from "anchor-bankrun";
 import { ProgramTestContext } from "solana-bankrun";
@@ -42,9 +44,11 @@ import {
   MatchStatus,
   TOKEN_PROGRAM_ID as ARENA_TOKEN_PROGRAM_ID,
   buildCreateMatchIx,
+  buildJoinMatchIx,
+  deriveAta,
   deriveMatchPda,
   deriveVaultAta,
-} from "../OpenFrontIO/src/server/arena/arenaProgram";
+} from "../OpenFrontIO/src/core/arena/arenaProgram";
 
 import idlJson from "../target/idl/arena.json";
 
@@ -202,6 +206,17 @@ describe("arenaProgram bindings", () => {
         ix.args.map((a) => a.name),
         ["entry_fee", "max_players", "rake_bps", "nonce"],
       );
+    });
+
+    it("join_match account order matches the IDL and it takes no args", () => {
+      const ix = idl.instructions.find((i) => i.name === "join_match")!;
+      assert.deepEqual(
+        ix.accounts.map((a) => a.name),
+        ["player", "match_account", "vault", "player_token", "token_program"],
+      );
+      // No amount arg on purpose: the program transfers match_account.entry_fee
+      // read from chain state, so a client cannot understake by lying.
+      assert.deepEqual(ix.args, []);
     });
 
     it("MatchStatus discriminants follow the IDL variant order", () => {
@@ -374,6 +389,76 @@ describe("arenaProgram bindings", () => {
       );
       assert.equal(data.readBigUInt64LE(64), 0n);
       assert.equal(ARENA_ATA_PROGRAM_ID.toBase58(), "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+    });
+
+    it("join_match built by arenaProgram.ts stakes the player on-chain", async () => {
+      const [matchPda] = deriveMatchPda(programId, authority.publicKey, NONCE);
+      const vault = deriveVaultAta(matchPda, mintKp.publicKey);
+
+      // A funded player with an ATA holding exactly the entry fee. The surplus
+      // check is the program's (FeeMismatch); an exact balance proves the
+      // transfer amount comes from the account, not from anything we passed.
+      const player = Keypair.generate();
+      context.setAccount(player.publicKey, {
+        lamports: 10_000_000_000,
+        data: Buffer.alloc(0),
+        owner: SystemProgram.programId,
+        executable: false,
+      });
+      const playerToken = deriveAta(player.publicKey, mintKp.publicKey);
+      await sendTx(
+        [
+          createAssociatedTokenAccountInstruction(
+            player.publicKey,
+            playerToken,
+            player.publicKey,
+            mintKp.publicKey,
+          ),
+          createMintToInstruction(
+            mintKp.publicKey,
+            playerToken,
+            authority.publicKey,
+            ENTRY_FEE,
+          ),
+        ],
+        [player, authority],
+      );
+
+      const ix = buildJoinMatchIx({
+        programId,
+        player: player.publicKey,
+        matchPda,
+        vault,
+        playerToken,
+      });
+      // Bare discriminator — join_match declares no args.
+      assert.equal(ix.data.length, 8, "join_match should carry no args");
+      assert.deepEqual(
+        Array.from(ix.data),
+        Array.from(IX_DISCRIMINATOR.join_match),
+      );
+
+      await sendTx([ix], [player]);
+
+      const raw = await context.banksClient.getAccount(matchPda);
+      const data = Buffer.from(raw!.data);
+      const L = MATCH_ACCOUNT_LAYOUT;
+
+      assert.equal(data.readUInt8(L.playerCount), 1);
+      assert.equal(
+        new PublicKey(data.subarray(L.players, L.players + 32)).toBase58(),
+        player.publicKey.toBase58(),
+        "players[0] should be the joining wallet",
+      );
+      assert.equal(data.readBigUInt64LE(L.stakes), ENTRY_FEE);
+      // 6 max players, 1 joined: still Open.
+      assert.equal(data.readUInt8(L.status), MatchStatus.Open);
+
+      // The stake left the player and landed in the PDA-owned vault.
+      const vaultRaw = await context.banksClient.getAccount(vault);
+      assert.equal(Buffer.from(vaultRaw!.data).readBigUInt64LE(64), ENTRY_FEE);
+      const playerRaw = await context.banksClient.getAccount(playerToken);
+      assert.equal(Buffer.from(playerRaw!.data).readBigUInt64LE(64), 0n);
     });
 
     it("rejects out-of-range arguments before they reach the chain", () => {
