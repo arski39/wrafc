@@ -349,7 +349,7 @@ dependency order:
 | **1** | Wagered start-gate + refund the unstartable | ✅ root `a283bfc`, ofio `c76ed24` |
 | **2** | `ARENA_DEV_BYPASS` containment — dev must not move real tokens | **blocked on two decisions** (see below) |
 | **H5** | Stop shipping upstream's identity (licensing) | ✅ ofio `8a9ab4d` |
-| **H3** | Program: timeout-cancel for a stranded `InProgress` match | ✅ root `HEAD` |
+| **H3** | Program: timeout-cancel for a stranded `InProgress` match | ✅ root `552425c` |
 | **H1** | Arena env vars + keypair mount through the deploy path | todo |
 | **H2** | Recovery sweeper (master-only, enumerates by authority) | todo, needs H1+H3 |
 | **H4** | Auth service — JWKS, `/auth/refresh`, `/auth/wallet`, `/users/@me` | todo |
