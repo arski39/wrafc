@@ -331,10 +331,18 @@ existing `settle(gameId, null, allClients)`. No new settlement logic: `settle()`
 escrow itself and only refunds when the chain says `Open`, so a match that did somehow
 reach `InProgress` is left alone rather than guessed at.
 
-**This is the single refund site.** `cancelUnfilledWageredMatch()` deliberately does not
-refund inline — it sets `_hasEnded`, `phase()` reports `Finished`, `GameManager` calls
-`end()`, and the refund happens there. Anything else that cancels a wagered lobby
-pre-start should route the same way rather than adding a second call.
+**This is the single refund site for a lobby this process still holds.**
+`cancelUnfilledWageredMatch()` deliberately does not refund inline — it sets
+`_hasEnded`, `phase()` reports `Finished`, `GameManager` calls `end()`, and the refund
+happens there. Anything else that cancels a wagered lobby pre-start should route the
+same way rather than adding a second call.
+
+The H2 sweeper is not an exception to that rule; it is what happens when the rule has
+nobody left to apply it. It refunds only escrows **no `GameServer` exists for any more**
+— the process that owned them died — so there is no `end()` to route through. The two
+cannot collide either, and not by luck: the sweeper's `Open` window starts an hour
+*past* `maxGameDuration`, which is exactly the point by which `end()` has already run
+for every lobby a live process was managing.
 
 Note also that `cancelUnfilledWageredMatch()` kicks with `kick_reason.wager_not_full`,
 **not** `kick_reason.match_cancelled`: the latter's client handler pushes the player back
