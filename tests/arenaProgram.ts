@@ -7,9 +7,10 @@
 //
 //   1. every constant is diffed against the generated target/idl/arena.json, so
 //      a program change that moves a discriminator or a field fails here;
-//   2. the create_match instruction the server would actually send is executed
-//      against the real program in bankrun and the resulting account decoded
-//      through the same offset table, so the bytes are proven, not just typed.
+//   2. the create_match and join_match instructions that would actually be sent
+//      are executed against the real program in bankrun and the resulting
+//      account is read back through decodeMatchAccount — the same decoder the
+//      server uses — so the bytes are proven, not just typed.
 //
 // (1) alone would pass on an IDL that is itself stale; (2) alone would pass on
 // a layout that happens to round-trip. Together they pin both.
@@ -45,6 +46,7 @@ import {
   TOKEN_PROGRAM_ID as ARENA_TOKEN_PROGRAM_ID,
   buildCreateMatchIx,
   buildJoinMatchIx,
+  decodeMatchAccount,
   deriveAta,
   deriveMatchPda,
   deriveVaultAta,
@@ -459,6 +461,88 @@ describe("arenaProgram bindings", () => {
       assert.equal(Buffer.from(vaultRaw!.data).readBigUInt64LE(64), ENTRY_FEE);
       const playerRaw = await context.banksClient.getAccount(playerToken);
       assert.equal(Buffer.from(playerRaw!.data).readBigUInt64LE(64), 0n);
+    });
+
+    it("decodeMatchAccount reads back what the program wrote", async () => {
+      const [matchPda, expectedBump] = deriveMatchPda(
+        programId,
+        authority.publicKey,
+        NONCE,
+      );
+      const raw = await context.banksClient.getAccount(matchPda);
+      const match = decodeMatchAccount(
+        Uint8Array.from(raw!.data),
+        new PublicKey(raw!.owner),
+        programId,
+      );
+
+      assert.equal(match.authority.toBase58(), authority.publicKey.toBase58());
+      assert.equal(match.mint.toBase58(), mintKp.publicKey.toBase58());
+      assert.equal(
+        match.vault.toBase58(),
+        deriveVaultAta(matchPda, mintKp.publicKey).toBase58(),
+      );
+      assert.equal(match.entryFee, ENTRY_FEE);
+      assert.equal(match.rakeBps, RAKE_BPS);
+      assert.equal(match.maxPlayers, MAX_PLAYERS_CFG);
+      assert.equal(match.nonce, NONCE);
+      assert.equal(match.bump, expectedBump);
+      assert.equal(match.status, MatchStatus.Open);
+      assert.isAbove(Number(match.createdAt), 0);
+
+      // players[]/stakes[] are trimmed to player_count — the preceding test
+      // joined exactly one player, so the 15 unused slots must not appear.
+      assert.equal(match.playerCount, 1);
+      assert.lengthOf(match.players, 1);
+      assert.lengthOf(match.stakes, 1);
+      assert.equal(match.stakes[0], ENTRY_FEE);
+      assert.notEqual(
+        match.players[0].toBase58(),
+        PublicKey.default.toBase58(),
+        "players[0] should be a real wallet, not a zeroed slot",
+      );
+    });
+
+    it("decodeMatchAccount refuses accounts it should not trust", async () => {
+      const [matchPda] = deriveMatchPda(programId, authority.publicKey, NONCE);
+      const raw = await context.banksClient.getAccount(matchPda);
+      const data = Uint8Array.from(raw!.data);
+
+      // Wrong owner: without this check any account of the right length would
+      // decode into a plausible match, letting a caller be pointed at bytes an
+      // attacker controls and read whatever players[] they wrote there.
+      assert.throws(
+        () => decodeMatchAccount(data, SystemProgram.programId, programId),
+        /owned by/,
+      );
+
+      const wrongDiscriminator = Uint8Array.from(data);
+      wrongDiscriminator[0] ^= 0xff;
+      assert.throws(
+        () => decodeMatchAccount(wrongDiscriminator, programId, programId),
+        /discriminator/,
+      );
+
+      assert.throws(
+        () => decodeMatchAccount(data.subarray(0, 100), programId, programId),
+        /expected 774 bytes/,
+      );
+
+      // player_count past max_players would read unpopulated slots and invent
+      // participants that never staked.
+      const overcount = Uint8Array.from(data);
+      overcount[MATCH_ACCOUNT_LAYOUT.playerCount] = MAX_PLAYERS_CFG + 1;
+      assert.throws(
+        () => decodeMatchAccount(overcount, programId, programId),
+        /implausible player counts/,
+      );
+
+      const badStatus = Uint8Array.from(data);
+      badStatus[MATCH_ACCOUNT_LAYOUT.status] = 9;
+      assert.throws(
+        () => decodeMatchAccount(badStatus, programId, programId),
+        /unknown MatchStatus/,
+      );
     });
 
     it("rejects out-of-range arguments before they reach the chain", () => {

@@ -100,11 +100,11 @@ A `Cargo.lock` is now committed. Keep it committed.
 ## Status of on-chain verification — ✅ GREEN
 - `anchor build` passes. Produces `target/deploy/arena.so`, `target/idl/arena.json`
   (all four instructions incl. `cancel_match`, 10 errors), `target/types/arena.ts`.
-- `anchor test --skip-deploy --skip-local-validator` — **19 passing, 0 failing.**
+- `anchor test --skip-deploy --skip-local-validator` — **21 passing, 0 failing.**
   - `tests/arena.ts` (7): happy path, rake math, double-join rejected, bad-signature
     rejected, plus the three `cancel_match` tests (refund, non-authority rejected,
     already-started rejected).
-  - `tests/arenaProgram.ts` (12): pins the hand-rolled program bindings
+  - `tests/arenaProgram.ts` (14): pins the hand-rolled program bindings
     (`OpenFrontIO/src/core/arena/arenaProgram.ts`) — see below.
 
 Use `--skip-deploy --skip-local-validator`. Plain `anchor test` fails: `--skip-local-validator`
@@ -120,8 +120,10 @@ drift from the program, so that suite pins both ends:
 1. every discriminator, field offset, account order and arg order is **diffed against
    the generated `target/idl/arena.json`**, and
 2. the `create_match` and `join_match` instructions that would actually be sent are
-   **executed against the real program in bankrun**, then the resulting account is
-   decoded back through the same offset table.
+   **executed against the real program in bankrun**, then the resulting account is read
+   back through `decodeMatchAccount` — the same decoder the server uses — including its
+   rejection paths (wrong owner, bad discriminator, short buffer, out-of-range
+   `player_count`/`status`).
 
 Either half alone is insufficient — (1) would pass against a stale IDL, (2) would pass on
 a layout that merely round-trips. Keep both when adding an instruction.
@@ -255,8 +257,8 @@ which is what it must now match.
   `create_match` (vault is a real PDA-owned ATA), `join_match`, `settle_match`
   (on-chain ed25519 verified), `cancel_match` (ported, hardened). **Compiles** under the
   toolchain above; `arena.so` + IDL + types are generated.
-- **Tests**: 19 passing across `tests/arena.ts` (program behaviour) and
-  `tests/arenaProgram.ts` (the shared program bindings).
+- **Tests**: 21 passing across `tests/arena.ts` (program behaviour) and
+  `tests/arenaProgram.ts` (the shared program bindings + decoder).
 - **OpenFrontIO wager integration**: the full stake loop is wired — host creates the
   escrow, every player (host included) stakes into it. Working: `arena/auth.ts` +
   `client/arena/walletAuth.ts` (SIWS-style wallet signature), `matchRegistry`,
@@ -266,9 +268,9 @@ which is what it must now match.
   `HostLobbyModal.ts`), and **Stage 3** (`onchainJoin.ts`'s real `join_match`,
   `WagerLobby.ts` mounted through `arena/wagerJoinFlow.ts` from `Main.ts`'s join funnel,
   wallet fields threaded `LobbyConfig` → `ClientJoinMessage`).
-  Still broken: `rpcClient.ts` (checks a tx signature, never reads
-  `MatchAccount.players[]`), `settler.ts` (wrong digest format, never submits) — so a
-  match can be staked but **not yet paid out**.
+  and **Stage 4** (`rpcClient.ts` reads and decodes the real `MatchAccount`).
+  Still broken: `settler.ts` (wrong digest format, never submits) — so a match can be
+  staked but **not yet paid out**.
 - Wagering is inert unless `ARENA_PROGRAM_ID` is set.
 - **Dependencies**: `OpenFrontIO/package-lock.json` was out of sync with its
   `package.json` (arena scaffolding added `@solana/web3.js`/`tweetnacl` without locking
@@ -320,8 +322,32 @@ Each stage is gated on `npx tsc --noEmit` (from `OpenFrontIO/`) before moving on
      stake retroactively.
    - `Main.ts` runs the gate **before** tearing down the existing lobby handle, so
      backing out of the stake prompt does not leave the player disconnected.
-4. **`rpcClient.ts`** — replace the tx-signature check with a real `MatchAccount`
-   fetch + fixed-offset decode + `players[0..player_count]` scan.
+4. ~~**`rpcClient.ts`** — real `MatchAccount` fetch + fixed-offset decode +
+   `players[0..player_count]` scan.~~ **DONE.** Notes for later stages:
+   - The decoder is `decodeMatchAccount()` in `core/arena/arenaProgram.ts`, not in
+     `rpcClient.ts`. It is **pure** — raw bytes in, `MatchAccountView` out — so bankrun
+     can feed it what the program actually wrote. `rpcClient.ts` keeps only the thin
+     `fetchMatchAccount(wager)` wrapper around the RPC call. **Stage 5 should rebuild
+     standings from `fetchMatchAccount(...).players`**, which is trimmed to
+     `player_count` and in join order — the order `settle_match`'s `scores` is indexed
+     against.
+   - `verifyOnchainMembership` now takes `(wager: WagerConfig, walletAddress)`; the
+     `txSig` parameter is gone. `ClientJoinMessage.onchainTxSig` is still sent and is
+     now **audit-only** — logged on a successful join so a disputed payout can be traced,
+     but it authorises nothing.
+   - Why the old check was unsafe: it only asserted that *some* confirmed transaction
+     touched the match PDA. Any transaction naming the account satisfies that, including
+     one that failed to stake, or one somebody else sent. Presence in `players[]` is
+     proof of payment because the program writes it only after `token::transfer`.
+   - The decoder validates **owner, discriminator, length, `MatchStatus` range and
+     `player_count <= max_players`** before trusting a field. The owner check is the
+     load-bearing one: without it any account of the right length decodes into a
+     plausible match. `tests/arenaProgram.ts` asserts each rejection.
+   - `verifyOnchainMembership` retries the read 3× at 400 ms. The joining browser may be
+     on a different RPC (`ARENA_PUBLIC_RPC_URL`) than the server, and a node briefly
+     behind would otherwise kick a player who genuinely paid.
+   - It also refuses a `Settled`/`Cancelled` match, and refuses one whose on-chain
+     `mint`/`vault`/`entry_fee` disagree with the registry entry.
 5. **`settler.ts`** — fix the digest to `sha256(matchPDA || winner || scores_u64_le)`;
    rebuild standings from on-chain `players[]` order; build the Ed25519 instruction
    (port `buildEd25519InstructionData` from `tests/arena.ts`) at index 0 plus the
