@@ -972,6 +972,26 @@ forgets to pass is a **production `ReferenceError` that tsc and lint cannot see*
 `AppShellBranding.test.ts` is the only thing that renders the template — extend it
 when you add a template variable.
 
+**And it has two renderers, which is how this bit us.** `RenderHtml.ts` renders
+it in production; **`vite.config.ts` renders it for `npm run dev`**, from its own
+hand-maintained copy of the same data. H5 added `siteOrigin`/`siteName`/
+`sourceRepoUrl` to the template and to `RenderHtml.ts` and not to the vite
+config, and Phase 2's `arenaDevBypass` went the same way — so `npm run dev`
+served a **500 (`siteOrigin is not defined`) for every page load** until it was
+found by trying to look at the UI. `git log -- vite.config.ts` showing no arena
+commits at all was the tell. `AppShellBranding.test.ts` now also asserts that
+every EJS variable in the template has a key in `vite.config.ts`; that half is a
+static text check, because the vite data lives inside `defineConfig`'s closure
+and inside `createHtmlPlugin`'s options, so there is nothing to import and
+render. **A new template variable needs adding in both places.**
+
+`arenaDevBypass` is deliberately the *requested* value in the vite config rather
+than the resolved one — `resolveDevBypass()` also asks the cluster for its
+genesis hash, which a config file cannot do. It is a hint that keeps the local
+wager loop testable, and the server remains the only thing that decides. It
+cannot leak past dev: `createHtmlPlugin` is only registered when
+`!isProduction`, and production renders through `RenderHtml.ts`.
+
 ## Conventions
 - Commits: conventional commits (`feat(arena):`, `fix(program):`, …).
 - Inside `OpenFrontIO/`, mark every edit to a pre-existing upstream file with an
