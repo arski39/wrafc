@@ -72,10 +72,12 @@ pub fn handler<'info>(
     let nonce_bytes = ctx.accounts.match_account.nonce.to_le_bytes();
     let bump = ctx.accounts.match_account.bump;
     let stakes = ctx.accounts.match_account.stakes;
+    let players = ctx.accounts.match_account.players;
+    let mint = ctx.accounts.match_account.mint;
 
     require!(
         ctx.remaining_accounts.len() >= count,
-        ArenaError::FeeMismatch
+        ArenaError::InvalidRefundAccount
     );
 
     let seeds: &[&[u8]] = &[b"match", authority_key.as_ref(), &nonce_bytes, &[bump]];
@@ -83,6 +85,34 @@ pub fn handler<'info>(
 
     for i in 0..count {
         let refund_account = &ctx.remaining_accounts[i];
+
+        // `remaining_accounts` bypasses `#[derive(Accounts)]` entirely, so
+        // nothing has validated this beyond the caller's word. Without the
+        // checks below the authority could name any token account of the right
+        // mint -- its own included -- and take every stake, which is precisely
+        // the custody CLAUDE.md's Hard Rules say the server never has.
+        //
+        // Done by hand rather than with `Account::try_from` because that would
+        // force the context's `'c` lifetime to `'info`. The owner check is the
+        // load-bearing one: `TokenAccount::try_deserialize` only unpacks, so
+        // without it any 165-byte account decodes into a plausible token
+        // account. The borrow is scoped so it is released before the CPI below,
+        // which needs the account mutably.
+        {
+            require!(
+                refund_account.owner == &token::ID,
+                ArenaError::InvalidRefundAccount
+            );
+            let data = refund_account.try_borrow_data()?;
+            let refund_token = TokenAccount::try_deserialize(&mut &data[..])
+                .map_err(|_| error!(ArenaError::InvalidRefundAccount))?;
+            require!(
+                refund_token.owner == players[i],
+                ArenaError::InvalidRefundAccount
+            );
+            require!(refund_token.mint == mint, ArenaError::InvalidRefundAccount);
+        }
+
         token::transfer(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),

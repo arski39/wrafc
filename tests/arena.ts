@@ -45,6 +45,10 @@ function buildSettleMessage(matchPDA: PublicKey, winner: PublicKey, scores: bigi
 
 // Helper: build Ed25519 program instruction data for one signature
 // Layout: num_sigs(1) pad(1) sig_off(2) sig_ix(2) pk_off(2) pk_ix(2) msg_off(2) msg_len(2) msg_ix(2) sig(64) pk(32) msg(N)
+//
+// The honest settle path uses web3.js's Ed25519Program builder (which is what
+// production sends); this stays because the adversarial tests below need
+// byte-level control the canonical builder deliberately does not offer.
 function buildEd25519InstructionData(pubkey: Uint8Array, sig: Uint8Array, message: Uint8Array): Buffer {
   const headerSize = 2 + (1 * 14); // 2-byte prefix + 14 bytes per sig header entry
   const sigOff = headerSize;
@@ -240,13 +244,14 @@ describe("arena", () => {
 
     const msg = buildSettleMessage(match, winner, scores);
     const sig = nacl.sign.detached(msg, serverKp.secretKey);
-    const ed25519Data = buildEd25519InstructionData(serverKp.publicKey, sig, msg);
 
     const scoresAnchored = scores.map((s) => new BN(s.toString()));
+    const serverAnchorKp = Keypair.fromSecretKey(Buffer.from(serverKp.secretKey));
 
     await program.methods
       .settleMatch(winner, scoresAnchored)
       .accounts({
+        authority: serverPubkey,
         matchAccount: match,
         vault,
         winnerToken: winnerAta,
@@ -254,16 +259,20 @@ describe("arena", () => {
         sysvarInstructions: anchor.web3.SYSVAR_INSTRUCTIONS_PUBKEY,
         tokenProgram: TOKEN_PROGRAM_ID,
       })
+      // The canonical builder, which is what settler.ts sends. Its payload
+      // order (pubkey before signature) differs from the hand-rolled helper
+      // above, so exercising it here is what proves the program reads the
+      // header offsets rather than assuming a layout.
       .preInstructions([
-        {
-          programId: anchor.web3.Ed25519Program.programId,
-          keys: [],
-          data: ed25519Data,
-        },
+        anchor.web3.Ed25519Program.createInstructionWithPublicKey({
+          publicKey: serverKp.publicKey,
+          message: msg,
+          signature: sig,
+        }),
       ])
-      // No .signers(): settle_match declares no Signer account. The server
-      // authorises via the ed25519 prelude instruction, not a tx signature, so
-      // adding the server key here fails with "unknown signer".
+      // settle_match now requires the authority to sign as well as attest. The
+      // two prove different things -- see the comment on SettleMatch.
+      .signers([serverAnchorKp])
       .rpc();
 
     return { match, winnerAta };
@@ -371,6 +380,7 @@ describe("arena", () => {
       await program.methods
         .settleMatch(player1Kp.publicKey, [new BN(200), new BN(100)])
         .accounts({
+          authority: serverPubkey,
           matchAccount: match,
           vault,
           winnerToken: winnerAta,
@@ -381,6 +391,9 @@ describe("arena", () => {
         .preInstructions([
           { programId: anchor.web3.Ed25519Program.programId, keys: [], data: ed25519Data },
         ])
+        // Signed by the real authority on purpose, so the only thing that can
+        // reject this is the digest check.
+        .signers([Keypair.fromSecretKey(Buffer.from(serverKp.secretKey))])
         .rpc();
     } catch (e: unknown) {
       threw = true;
@@ -498,6 +511,42 @@ describe("arena", () => {
     }
   }
 
+  /**
+   * Mint both players enough to stake again.
+   *
+   * They start with 1000 and every join costs ENTRY_FEE, so a suite this long
+   * exhausts them and the next join fails with FeeMismatch -- which looks
+   * exactly like a bug in whatever is being tested. Tests added after the
+   * originals call this rather than raising the opening balance, because the
+   * early tests assert absolute amounts against it.
+   */
+  let topUpCount = 0;
+  async function topUpPlayers(amount = 1_000) {
+    const serverAnchorKp = Keypair.fromSecretKey(Buffer.from(serverKp.secretKey));
+    // The counter is not cosmetic. bankrun reuses one blockhash, so an
+    // identical transaction is rejected as "already processed" before it runs;
+    // varying the amount by one is what keeps each top-up a distinct message.
+    const each = amount + topUpCount++;
+    await sendTx(
+      [
+        createMintToInstruction(
+          mint,
+          await playerAta(player1Kp.publicKey),
+          serverPubkey,
+          each,
+        ),
+        createMintToInstruction(
+          mint,
+          await playerAta(player2Kp.publicKey),
+          serverPubkey,
+          each,
+        ),
+      ],
+      serverAnchorKp,
+      [serverAnchorKp],
+    );
+  }
+
   /** Fills a match to MAX_PLAYERS, which flips it Open -> InProgress. */
   async function doFilledMatch(nonce: bigint) {
     await doCreateMatch(nonce);
@@ -607,5 +656,428 @@ describe("arena", () => {
       assert.include(msg, "NotOpen", `unexpected error: ${msg}`);
     }
     assert.isTrue(threw, "expected NotOpen error");
+  });
+
+  // --- adversarial: the ed25519 prelude ---------------------------------
+  //
+  // settle_match reads the Ed25519 precompile instruction at index 0 and trusts
+  // the pubkey and message it finds at the offsets that instruction encodes.
+  // Everything below attacks that reading. Each one signs with the *real*
+  // authority on purpose, so the signer requirement cannot be what rejects it —
+  // the only thing under test is the prelude check.
+
+  it("rejects a prelude whose offsets point at another instruction", async () => {
+    // THE ATTACK THE INSTRUCTION-INDEX CHECK EXISTS FOR.
+    //
+    // Ed25519SignatureOffsets carries an instruction index beside each offset.
+    // Only u16::MAX means "read from this instruction"; anything else makes the
+    // precompile read from a different instruction in the same transaction. So
+    // an attacker points it at a second instruction holding their own key and
+    // message — which verifies perfectly — while laying out the prelude's own
+    // bytes so the same offsets hold the authority's pubkey and the expected
+    // digest. Before the check, this settled: any player could name themselves
+    // the winner and take the pot.
+    const nonce = 20n;
+    await topUpPlayers();
+    await doFilledMatch(nonce);
+    const [match] = matchPDA(nonce);
+    const vault = vaultAta(match);
+
+    const winner = player2Kp.publicKey;
+    const scores = [1n, 999n];
+    const digest = buildSettleMessage(match, winner, scores);
+
+    // ix 1 — a genuinely valid, self-referential ed25519 instruction signed by
+    // the attacker over a message only they care about.
+    const attackerMsg = Buffer.alloc(32, 7);
+    const attackerSig = nacl.sign.detached(attackerMsg, player2Kp.secretKey);
+    const decoy = buildEd25519InstructionData(
+      player2Kp.publicKey.toBytes(),
+      attackerSig,
+      attackerMsg,
+    );
+
+    // ix 0 — the forgery. The offsets are the decoy's own layout, the indices
+    // send the precompile there, and the filler sitting at those offsets here
+    // is what the program reads instead.
+    const SIG_OFF = 16;
+    const PK_OFF = 80;
+    const MSG_OFF = 112;
+    const forged = Buffer.alloc(MSG_OFF + 32);
+    forged[0] = 1;
+    forged[1] = 0;
+    forged.writeUInt16LE(SIG_OFF, 2);
+    forged.writeUInt16LE(1, 4); // signature_instruction_index -> ix 1
+    forged.writeUInt16LE(PK_OFF, 6);
+    forged.writeUInt16LE(1, 8); // public_key_instruction_index -> ix 1
+    forged.writeUInt16LE(MSG_OFF, 10);
+    forged.writeUInt16LE(32, 12);
+    forged.writeUInt16LE(1, 14); // message_instruction_index -> ix 1
+    Buffer.from(serverKp.publicKey).copy(forged, PK_OFF);
+    digest.copy(forged, MSG_OFF);
+
+    let threw = false;
+    try {
+      await program.methods
+        .settleMatch(winner, scores.map((x) => new BN(x.toString())))
+        .accounts({
+          authority: serverPubkey,
+          matchAccount: match,
+          vault,
+          winnerToken: await playerAta(winner),
+          treasuryToken: treasuryAta,
+          sysvarInstructions: anchor.web3.SYSVAR_INSTRUCTIONS_PUBKEY,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .preInstructions([
+          { programId: anchor.web3.Ed25519Program.programId, keys: [], data: forged },
+          { programId: anchor.web3.Ed25519Program.programId, keys: [], data: decoy },
+        ])
+        .signers([Keypair.fromSecretKey(Buffer.from(serverKp.secretKey))])
+        .rpc();
+    } catch (e: unknown) {
+      threw = true;
+      const msg = (e as Error).message ?? "";
+      assert.include(msg, "InvalidResultSignature", `unexpected error: ${msg}`);
+    }
+    assert.isTrue(threw, "forged prelude must not settle the match");
+
+    const acct = await program.account.matchAccount.fetch(match);
+    assert.isTrue("inProgress" in acct.status, "match must still be InProgress");
+  });
+
+  it("rejects a prelude carrying more than one signature", async () => {
+    // The program parses only the first offsets record, so a second unverified
+    // one alongside it says nothing about what was attested. Refuse the shape
+    // rather than reason about it.
+    const nonce = 21n;
+    await topUpPlayers();
+    await doFilledMatch(nonce);
+    const [match] = matchPDA(nonce);
+    const vault = vaultAta(match);
+
+    const winner = player1Kp.publicKey;
+    const scores = [200n, 100n];
+    const digest = buildSettleMessage(match, winner, scores);
+    const honestSig = nacl.sign.detached(digest, serverKp.secretKey);
+    const otherMsg = Buffer.alloc(32, 3);
+    const otherSig = nacl.sign.detached(otherMsg, player2Kp.secretKey);
+
+    // Two self-referential records, both of which the precompile verifies, so
+    // only the program's own num_signatures check can reject this.
+    const HEADER = 2 + 14 * 2;
+    const data = Buffer.alloc(HEADER + 2 * (64 + 32 + 32));
+    data[0] = 2;
+    const writeRecord = (
+      recordAt: number,
+      sigOff: number,
+      pkOff: number,
+      msgOff: number,
+    ) => {
+      data.writeUInt16LE(sigOff, recordAt);
+      data.writeUInt16LE(0xffff, recordAt + 2);
+      data.writeUInt16LE(pkOff, recordAt + 4);
+      data.writeUInt16LE(0xffff, recordAt + 6);
+      data.writeUInt16LE(msgOff, recordAt + 8);
+      data.writeUInt16LE(32, recordAt + 10);
+      data.writeUInt16LE(0xffff, recordAt + 12);
+    };
+    writeRecord(2, HEADER, HEADER + 64, HEADER + 96);
+    writeRecord(16, HEADER + 128, HEADER + 192, HEADER + 224);
+    Buffer.from(honestSig).copy(data, HEADER);
+    Buffer.from(serverKp.publicKey).copy(data, HEADER + 64);
+    digest.copy(data, HEADER + 96);
+    Buffer.from(otherSig).copy(data, HEADER + 128);
+    player2Kp.publicKey.toBuffer().copy(data, HEADER + 192);
+    otherMsg.copy(data, HEADER + 224);
+
+    let threw = false;
+    try {
+      await program.methods
+        .settleMatch(winner, scores.map((x) => new BN(x.toString())))
+        .accounts({
+          authority: serverPubkey,
+          matchAccount: match,
+          vault,
+          winnerToken: await playerAta(winner),
+          treasuryToken: treasuryAta,
+          sysvarInstructions: anchor.web3.SYSVAR_INSTRUCTIONS_PUBKEY,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .preInstructions([
+          { programId: anchor.web3.Ed25519Program.programId, keys: [], data },
+        ])
+        .signers([Keypair.fromSecretKey(Buffer.from(serverKp.secretKey))])
+        .rpc();
+    } catch (e: unknown) {
+      threw = true;
+      const msg = (e as Error).message ?? "";
+      assert.include(msg, "InvalidResultSignature", `unexpected error: ${msg}`);
+    }
+    assert.isTrue(threw, "multi-signature prelude must be rejected");
+  });
+
+  it("rejects a prelude too short to hold a full offsets record", async () => {
+    // 14 bytes is one field short: message_instruction_index lives at 14..16.
+    // The precompile refuses this too, so the assertion is only that it does
+    // not settle — the program's own length check is what keeps the reads in
+    // bounds if that ever stops being true.
+    const nonce = 22n;
+    await topUpPlayers();
+    await doFilledMatch(nonce);
+    const [match] = matchPDA(nonce);
+    const vault = vaultAta(match);
+    const short = Buffer.alloc(14);
+    short[0] = 1;
+
+    let threw = false;
+    try {
+      await program.methods
+        .settleMatch(player1Kp.publicKey, [new BN(200), new BN(100)])
+        .accounts({
+          authority: serverPubkey,
+          matchAccount: match,
+          vault,
+          winnerToken: await playerAta(player1Kp.publicKey),
+          treasuryToken: treasuryAta,
+          sysvarInstructions: anchor.web3.SYSVAR_INSTRUCTIONS_PUBKEY,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .preInstructions([
+          { programId: anchor.web3.Ed25519Program.programId, keys: [], data: short },
+        ])
+        .signers([Keypair.fromSecretKey(Buffer.from(serverKp.secretKey))])
+        .rpc();
+    } catch {
+      threw = true;
+    }
+    assert.isTrue(threw, "truncated prelude must be rejected");
+  });
+
+  it("rejects a settle submitted by someone other than the authority", async () => {
+    // The digest names the winner but not the payout account, so without a
+    // signer anyone who saw a settle transaction could rebuild it around the
+    // same prelude and their own winner_token.
+    const nonce = 23n;
+    await topUpPlayers();
+    await doFilledMatch(nonce);
+    const [match] = matchPDA(nonce);
+    const vault = vaultAta(match);
+    const winner = player1Kp.publicKey;
+    const scores = [200n, 100n];
+    const digest = buildSettleMessage(match, winner, scores);
+    const sig = nacl.sign.detached(digest, serverKp.secretKey);
+
+    let threw = false;
+    try {
+      await program.methods
+        .settleMatch(winner, scores.map((x) => new BN(x.toString())))
+        .accounts({
+          authority: player2Kp.publicKey,
+          matchAccount: match,
+          vault,
+          winnerToken: await playerAta(winner),
+          treasuryToken: treasuryAta,
+          sysvarInstructions: anchor.web3.SYSVAR_INSTRUCTIONS_PUBKEY,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .preInstructions([
+          anchor.web3.Ed25519Program.createInstructionWithPublicKey({
+            publicKey: serverKp.publicKey,
+            message: digest,
+            signature: sig,
+          }),
+        ])
+        .signers([player2Kp])
+        .rpc();
+    } catch (e: unknown) {
+      threw = true;
+      const msg = (e as Error).message ?? "";
+      assert.include(msg, "Unauthorized", `unexpected error: ${msg}`);
+    }
+    assert.isTrue(threw, "a non-authority must not be able to settle");
+  });
+
+  it("rejects a payout into a token account the winner does not own", async () => {
+    const nonce = 24n;
+    await topUpPlayers();
+    await doFilledMatch(nonce);
+    const [match] = matchPDA(nonce);
+    const vault = vaultAta(match);
+    const winner = player1Kp.publicKey;
+    const scores = [200n, 100n];
+    const digest = buildSettleMessage(match, winner, scores);
+    const sig = nacl.sign.detached(digest, serverKp.secretKey);
+
+    let threw = false;
+    try {
+      await program.methods
+        .settleMatch(winner, scores.map((x) => new BN(x.toString())))
+        .accounts({
+          authority: serverPubkey,
+          matchAccount: match,
+          vault,
+          // Right mint, wrong owner — SPL would happily accept this transfer.
+          winnerToken: treasuryAta,
+          treasuryToken: treasuryAta,
+          sysvarInstructions: anchor.web3.SYSVAR_INSTRUCTIONS_PUBKEY,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .preInstructions([
+          anchor.web3.Ed25519Program.createInstructionWithPublicKey({
+            publicKey: serverKp.publicKey,
+            message: digest,
+            signature: sig,
+          }),
+        ])
+        .signers([Keypair.fromSecretKey(Buffer.from(serverKp.secretKey))])
+        .rpc();
+    } catch (e: unknown) {
+      threw = true;
+      const msg = (e as Error).message ?? "";
+      assert.include(msg, "WinnerTokenOwnerMismatch", `unexpected error: ${msg}`);
+    }
+    assert.isTrue(threw, "payout destination must belong to the winner");
+  });
+
+  it("cancel_match refuses a refund account that is not the staker's", async () => {
+    // remaining_accounts bypasses #[derive(Accounts)] entirely. Without the
+    // pairing check the authority could name any token account of the right
+    // mint and take every stake — the custody CLAUDE.md says it never has.
+    const nonce = 25n;
+    await topUpPlayers();
+    await doCreateMatch(nonce);
+    await doJoinMatch(nonce, player1Kp);
+
+    let threw = false;
+    try {
+      await doCancelMatch(nonce, [treasuryAta]);
+    } catch (e: unknown) {
+      threw = true;
+      const msg = (e as Error).message ?? "";
+      assert.include(msg, "InvalidRefundAccount", `unexpected error: ${msg}`);
+    }
+    assert.isTrue(threw, "a mismatched refund account must be rejected");
+
+    // ...and the honest list still works, so the check is not simply refusing
+    // everything.
+    const p1Ata = await playerAta(player1Kp.publicKey);
+    const before = await getTokenAccount(p1Ata);
+    await doCancelMatch(nonce, [p1Ata]);
+    const after = await getTokenAccount(p1Ata);
+    assert.equal(
+      Number(after.amount) - Number(before.amount),
+      Number(ENTRY_FEE),
+      "staker should be refunded their entry fee",
+    );
+  });
+
+  // --- close_match -------------------------------------------------------
+
+  async function doCloseMatch(nonce: bigint, signerKp?: Keypair) {
+    const serverAnchorKp = Keypair.fromSecretKey(Buffer.from(serverKp.secretKey));
+    const signer = signerKp ?? serverAnchorKp;
+    const [match] = matchPDA(nonce);
+    await program.methods
+      .closeMatch()
+      .accounts({
+        authority: signer.publicKey,
+        matchAccount: match,
+        vault: vaultAta(match),
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .signers([signer])
+      .rpc();
+    return match;
+  }
+
+  it("close_match reclaims the rent from a settled match", async () => {
+    const nonce = 26n;
+    await topUpPlayers();
+    await doFilledMatch(nonce);
+    await doSettleMatch(nonce, player1Kp.publicKey, [200n, 100n]);
+
+    const [match] = matchPDA(nonce);
+    const vault = vaultAta(match);
+    const before = await context.banksClient.getAccount(serverPubkey);
+    await doCloseMatch(nonce);
+
+    assert.isNull(
+      await context.banksClient.getAccount(match),
+      "match account should be gone",
+    );
+    assert.isNull(
+      await context.banksClient.getAccount(vault),
+      "vault should be gone",
+    );
+    const after = await context.banksClient.getAccount(serverPubkey);
+    assert.isAbove(
+      Number(after!.lamports),
+      Number(before!.lamports),
+      "rent should return to the authority",
+    );
+  });
+
+  it("close_match is rejected while the match can still move money", async () => {
+    const nonce = 27n;
+    await topUpPlayers();
+    await doCreateMatch(nonce);
+    await doJoinMatch(nonce, player1Kp);
+
+    let threw = false;
+    try {
+      await doCloseMatch(nonce);
+    } catch (e: unknown) {
+      threw = true;
+      const msg = (e as Error).message ?? "";
+      assert.include(msg, "MatchNotTerminal", `unexpected error: ${msg}`);
+    }
+    assert.isTrue(threw, "an Open match must not be closable");
+  });
+
+  it("close_match by a non-authority is rejected", async () => {
+    const nonce = 28n;
+    await topUpPlayers();
+    await doFilledMatch(nonce);
+    await doSettleMatch(nonce, player1Kp.publicKey, [200n, 100n]);
+
+    let threw = false;
+    try {
+      await doCloseMatch(nonce, player2Kp);
+    } catch (e: unknown) {
+      threw = true;
+      const msg = (e as Error).message ?? "";
+      assert.include(msg, "Unauthorized", `unexpected error: ${msg}`);
+    }
+    assert.isTrue(threw, "only the authority may close a match");
+  });
+
+  it("close_match is rejected while the vault still holds tokens", async () => {
+    // Reachable in practice: cancel_match refunds `stakes`, not the balance, so
+    // a match somebody donated into keeps a residue.
+    const nonce = 29n;
+    await topUpPlayers();
+    await doCreateMatch(nonce);
+    await doJoinMatch(nonce, player1Kp);
+    const p1Ata = await playerAta(player1Kp.publicKey);
+    await doCancelMatch(nonce, [p1Ata]);
+
+    const [match] = matchPDA(nonce);
+    const serverAnchorKp = Keypair.fromSecretKey(Buffer.from(serverKp.secretKey));
+    await sendTx(
+      [createMintToInstruction(mint, vaultAta(match), serverPubkey, 5)],
+      serverAnchorKp,
+      [serverAnchorKp],
+    );
+
+    let threw = false;
+    try {
+      await doCloseMatch(nonce);
+    } catch (e: unknown) {
+      threw = true;
+      const msg = (e as Error).message ?? "";
+      assert.include(msg, "VaultNotEmpty", `unexpected error: ${msg}`);
+    }
+    assert.isTrue(threw, "a non-empty vault must block the close");
   });
 });

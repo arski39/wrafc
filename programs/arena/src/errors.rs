@@ -27,4 +27,14 @@ pub enum ArenaError {
     // the TypeScript side matches on.
     #[msg("Match has not been in progress long enough to be force-cancelled")]
     MatchNotTimedOut,
+    #[msg("Winner token account is not owned by the winner")]
+    WinnerTokenOwnerMismatch,
+    #[msg("Refund account does not belong to the staker it is paired with")]
+    InvalidRefundAccount,
+    #[msg("Arithmetic overflow")]
+    MathOverflow,
+    #[msg("Vault still holds tokens")]
+    VaultNotEmpty,
+    #[msg("Match is not in a terminal state")]
+    MatchNotTerminal,
 }

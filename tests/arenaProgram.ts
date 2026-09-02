@@ -47,6 +47,7 @@ import {
   MatchStatus,
   TOKEN_PROGRAM_ID as ARENA_TOKEN_PROGRAM_ID,
   buildCancelMatchIx,
+  buildCloseMatchIx,
   buildCreateAtaIdempotentIx,
   buildCreateMatchIx,
   buildEd25519VerifyIx,
@@ -234,6 +235,7 @@ describe("arenaProgram bindings", () => {
       assert.deepEqual(
         ix.accounts.map((a) => a.name),
         [
+          "authority",
           "match_account",
           "vault",
           "winner_token",
@@ -246,9 +248,11 @@ describe("arenaProgram bindings", () => {
         ix.args.map((a) => a.name),
         ["winner", "scores"],
       );
-      // No Signer account: the server authorises through the ed25519 prelude
-      // instruction, not by signing this one.
-      assert.isUndefined(ix.accounts.find((a) => a.signer === true));
+      // The authority signs AND attests. The prelude proves what was attested;
+      // this signature proves who submitted it. Dropping the signer would put
+      // the payout destination back within a frontrunner's reach, because the
+      // digest names the winner but not the account the tokens land in.
+      assert.isTrue(ix.accounts[0].signer, "authority must sign a settle");
     });
 
     it("cancel_match account order matches the IDL", () => {
@@ -259,6 +263,20 @@ describe("arenaProgram bindings", () => {
       );
       assert.deepEqual(ix.args, []);
       assert.isTrue(ix.accounts[0].signer, "authority must sign a cancel");
+    });
+
+    it("close_match account order matches the IDL", () => {
+      const ix = idl.instructions.find((i) => i.name === "close_match")!;
+      assert.deepEqual(
+        ix.accounts.map((a) => a.name),
+        ["authority", "match_account", "vault", "token_program"],
+      );
+      assert.deepEqual(ix.args, []);
+      assert.isTrue(ix.accounts[0].signer, "authority must sign a close");
+      assert.isTrue(
+        ix.accounts[0].writable,
+        "authority receives both rents, so it must be writable",
+      );
     });
 
     it("MatchStatus discriminants follow the IDL variant order", () => {
@@ -841,6 +859,7 @@ describe("arenaProgram bindings", () => {
           ),
           buildSettleMatchIx({
             programId,
+            authority: authority.publicKey,
             matchPda,
             vault,
             winnerToken,
@@ -881,6 +900,7 @@ describe("arenaProgram bindings", () => {
           ),
           buildSettleMatchIx({
             programId,
+            authority: authority.publicKey,
             matchPda,
             vault,
             winnerToken: deriveAta(winner, mintKp.publicKey),
@@ -909,6 +929,7 @@ describe("arenaProgram bindings", () => {
           buildEd25519VerifyIx(impostor.publicKey.toBytes(), signature, digest),
           buildSettleMatchIx({
             programId,
+            authority: authority.publicKey,
             matchPda,
             vault,
             winnerToken: deriveAta(winner, mintKp.publicKey),
@@ -982,6 +1003,39 @@ describe("arenaProgram bindings", () => {
         );
       }
       assert.equal((await readMatch(matchPda)).status, MatchStatus.Cancelled);
+
+      // ...and the rent comes back. Executed here rather than only diffed
+      // against the IDL because a close that silently leaves the vault behind
+      // still looks correct from the account list alone.
+      const authorityBefore = (await context.banksClient.getAccount(
+        authority.publicKey,
+      ))!.lamports;
+      await sendTx(
+        [
+          buildCloseMatchIx({
+            programId,
+            authority: authority.publicKey,
+            matchPda,
+            vault,
+          }),
+        ],
+        [authority],
+      );
+      assert.isNull(
+        await context.banksClient.getAccount(matchPda),
+        "close_match should deallocate the match account",
+      );
+      assert.isNull(
+        await context.banksClient.getAccount(vault),
+        "close_match should close the vault too, not just the match",
+      );
+      assert.isAbove(
+        Number(
+          (await context.banksClient.getAccount(authority.publicKey))!.lamports,
+        ),
+        Number(authorityBefore),
+        "both rents should return to the authority",
+      );
     });
   });
 });

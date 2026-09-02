@@ -3,7 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "test": "ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
+    "test": "ts-mocha -p ./tsconfig.json -t 1000000 tests/*.ts",
+    "test:surfpool": "ts-mocha -p ./tsconfig.json -t 180000 tests/surfpool/*.ts"
   },
   "devDependencies": {
     "@coral-xyz/anchor": "^0.31.1",

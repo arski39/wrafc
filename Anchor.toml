@@ -3,7 +3,7 @@ seeds = false
 skip-lint = false
 
 [programs.localnet]
-arena = "Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS"
+arena = "4CGRLB5WJ4LK4nqwhzN5uhU78cakuHzG5wfrUZrQ2G64"
 
 [registry]
 url = "https://api.apr.dev"
@@ -13,4 +13,6 @@ cluster = "Localnet"
 wallet = "~/.config/solana/id.json"
 
 [scripts]
-test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
+# tests/*.ts, not tests/**/*.ts: tests/surfpool/ needs a validator listening
+# and is run on its own (see docs/surfpool.md).
+test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/*.ts"

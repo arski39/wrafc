@@ -10,6 +10,9 @@ dist/
 # Analysis artifacts
 graphify-out/
 
+# Surfpool writes per-run simnet logs here (see docs/surfpool.md)
+.surfpool/
+
 # Secrets — never commit keypairs or environment files
 .env
 .env.*

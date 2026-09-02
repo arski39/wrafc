@@ -99,16 +99,18 @@ A `Cargo.lock` is now committed. Keep it committed.
 
 ## Status of on-chain verification — ✅ GREEN
 - `anchor build` passes. Produces `target/deploy/arena.so`, `target/idl/arena.json`
-  (all four instructions incl. `cancel_match`, **11** errors, and one `#[constant]`),
-  `target/types/arena.ts`.
-- `anchor test --skip-deploy --skip-local-validator` — **31 passing, 0 failing.**
-  - `tests/arena.ts` (10): happy path, rake math, double-join rejected,
-    bad-signature rejected, and the six `cancel_match` tests — refund,
-    non-authority rejected, in-progress-before-timeout rejected,
-    in-progress-after-timeout refunds, settle still works past the timeout,
-    settled-match cancel rejected.
-  - `tests/arenaProgram.ts` (21): pins the hand-rolled program bindings
+  (all **five** instructions incl. `cancel_match` and `close_match`, **16** errors,
+  and one `#[constant]`), `target/types/arena.ts`.
+- `anchor test --skip-deploy --skip-local-validator` — **42 passing, 0 failing.**
+  - `tests/arena.ts` (20): happy path, rake math, double-join rejected,
+    bad-signature rejected, the six `cancel_match` tests, the four adversarial
+    ed25519/authority tests (see the security section below), the refund-account
+    pairing test, and four `close_match` tests.
+  - `tests/arenaProgram.ts` (22): pins the hand-rolled program bindings
     (`OpenFrontIO/src/core/arena/arenaProgram.ts`) — see below.
+- `npm run test:surfpool` (3 more, **not** part of `anchor test`) runs against a
+  really-deployed program on a local Surfpool validator, because bankrun cannot
+  reach a 24-hour deadline. See `docs/surfpool.md`.
 
 Use `--skip-deploy --skip-local-validator`. Plain `anchor test` fails: `--skip-local-validator`
 alone still tries to *deploy* to `127.0.0.1:8899`, and these tests need no validator —
@@ -153,9 +155,18 @@ which type-checks via `@types/node` and is simply `undefined` in a browser.
   `connection.sendTransaction`, and `BankrunProvider.connection` is a BanksClient shim,
   not a real `Connection`. Use the instruction builders plus the local `sendTx()` /
   `getTokenAccount()` helpers.
-- **`settle_match` takes no `.signers([...])`.** It declares no `Signer` account — the
-  server authorises via the ed25519 prelude instruction. Passing the server key there
-  fails with `unknown signer`.
+- **`settle_match` requires `.signers([authority])`.** This used to say the
+  opposite — it declared no `Signer` at all and the ed25519 prelude was the whole
+  authorisation, which is what made the prelude bug below a total break. It now
+  takes the authority as a signer *as well as* an attester. The suite's `serverKp`
+  is a raw `nacl.sign.keyPair()`, so wrap it:
+  `Keypair.fromSecretKey(Buffer.from(serverKp.secretKey))` — nacl's 64-byte
+  secret key is already the web3.js layout.
+- **Players run out of tokens.** They are minted 1000 each and every join costs
+  `ENTRY_FEE`, so a long suite exhausts them and the next join fails with
+  `FeeMismatch` — which looks exactly like a bug in whatever is under test. Call
+  `topUpPlayers()`. It varies the amount by one per call on purpose; see the
+  blockhash note below.
 - **bankrun reuses one blockhash**, so re-sending an identical transaction is rejected
   as "already processed" before the program runs. The double-join test therefore
   resubmits with a different fee payer to make the transaction distinct.
@@ -176,6 +187,12 @@ which type-checks via `@types/node` and is simply `undefined` in a browser.
   `sha256(match_account.key() || winner || scores_as_u64_le)`. The signing side must
   produce **exactly** those bytes — see `tests/arena.ts`'s `buildSettleMessage()`, which
   is the reference implementation. Raw bytes; **not** JSON, not the game id string.
+- **Reading that prelude means checking the three `*_instruction_index` fields.**
+  They are the difference between verifying a signature and being told one was
+  verified. See the security section below; a mutation test proves it.
+- `settle_match` **must** also take the authority as a `Signer`. The prelude
+  proves *what was attested*; the signature on the instruction proves *who
+  submitted it*, which is what stops a frontrunner redirecting the payout.
 - Keep TypeScript strict. No `any` in new code except WebSocket message-parsing
   boundaries — type those with discriminated unions (OpenFrontIO uses Zod schemas in
   `src/core/Schemas.ts` for this).
@@ -183,6 +200,168 @@ which type-checks via `@types/node` and is simply `undefined` in a browser.
 - Never commit keypairs. `.env` and `*keypair*.json` are gitignored — keep it that way.
 - When touching settlement math or account layout, add/update a bankrun test in the
   same change.
+
+## 🔴 The security pass — what was wrong, and what now holds it shut
+
+Prompted by vendoring `solana-foundation/solana-dev-skill` (see below) and
+running its `references/security.md` checklist over `programs/arena/`. Found
+before any deploy, so nothing was ever at risk — but every item here would have
+been live the moment Phase 3 put the program on devnet with real tokens.
+
+### The critical one: the ed25519 prelude could be forged by any player
+
+`settle_match` read the Ed25519 precompile instruction at index 0 and checked the
+pubkey and message bytes **at the offsets that instruction itself encodes** —
+while never checking the three `*_instruction_index` fields of
+`Ed25519SignatureOffsets`.
+
+Those fields decide *which instruction in the transaction* the precompile reads
+the signature, pubkey and message from. Only `u16::MAX` means "this one"; any
+other value indexes into the transaction's other instructions (Agave's
+`precompiles/src/ed25519.rs`, `get_data_slice`). So:
+
+| ix | contents |
+|---|---|
+| 0 | Ed25519Program, header setting `sig_ix = pk_ix = msg_ix = 1`. Its *own* bytes at `pk_off` hold the authority's pubkey and at `msg_off` the expected digest — inert filler nothing verifies. |
+| 1 | any instruction whose bytes at those same offsets are the **attacker's** key, message and signature. |
+| 2 | `settle_match(winner = attacker, …)` |
+
+The precompile verifies the attacker's own signature over the attacker's own
+message and returns Ok; `settle_match` reads instruction 0's filler, sees the
+authority's key and the right digest, and pays out. The winner only has to be in
+`players[]`, which in a 1v1 the attacker is. **Any player in any wagered match
+could take the whole pot at will**, and `SettleMatch` declared no `Signer`, so
+this was the only authorization there was.
+
+A documented class, not a theoretical one —
+[Cantina](https://www.cantina.security/blog/signature-verification-risks-in-solana),
+[Asymmetric on Relay](https://blog.asymmetric.re/wrong-offset-bypassing-signature-verification-in-relay/).
+The tests never caught it because `buildEd25519InstructionData` writes `0xffff`
+for all three indices: they tested the honest client, and nothing tested a
+dishonest one.
+
+**The fix** pins all three to `u16::MAX`, plus `num_signatures == 1` and a
+16-byte minimum (`message_instruction_index` lives at `d[14..16]`; the old check
+was `>= 14`). With the indices pinned, the bytes the precompile verified *are*
+the bytes the program reads, so there is nothing left to substitute. Deliberately
+layout-agnostic rather than pinning exact offsets, because web3.js's
+`Ed25519Program` orders the payload pubkey-then-signature while
+`tests/arena.ts`'s helper does signature-then-pubkey.
+
+**The mutation test is the proof.** Remove that one `require!`, rebuild, and
+`rejects a prelude whose offsets point at another instruction` fails — because
+the forged settlement succeeds. Anyone editing this should run that experiment
+once rather than take the comment's word for it.
+
+**A sibling attack that does *not* work**, checked so nobody re-derives it:
+`num_signatures = 0` is refused by the precompile itself
+(`num_signatures == 0 && data.len() > 2` → `InvalidInstructionDataSize`).
+
+### `cancel_match` let the authority take every stake
+
+`ctx.remaining_accounts[i]` went straight into `token::transfer` as the
+destination for `stakes[i]`, with nothing checking it belonged to `players[i]` —
+the skill's "unvalidated remaining_accounts" entry verbatim. Only the authority
+can call it, but that is the point: the Hard Rule above says the server never
+custodies stakes, and until now that was a documented rule with nothing behind
+it — the same shape as the Phase 1 start-gate and the stake cap.
+
+Each refund account is now deserialized and checked for `owner == players[i]` and
+`mint == match_account.mint`. Done by hand rather than with `Account::try_from`,
+which would force the context's `'c` lifetime to `'info`; the explicit
+`owner == token::ID` check is load-bearing, because `TokenAccount::try_deserialize`
+only unpacks and any 165-byte account would otherwise decode. Mutation-checked
+the same way.
+
+### The digest never bound the payout destination
+
+`sha256(match_pda ‖ winner ‖ scores)` says *who won*, not *where the money goes*,
+and `winner_token` was unconstrained. Anyone who saw a settle transaction could
+rebuild it around the same prelude with their own `winner_token` and win the
+race. Two fixes, either of which would do:
+
+- `winner_token.owner == winner`, so a frontrunner's only possible outcome is the
+  intended one.
+- **`authority: Signer` on `SettleMatch`**, which closes the race outright.
+  Free — `settler.ts` already signs as fee payer. Both mechanisms stay and
+  `settle_match.rs` says why: the prelude proves what was attested and is
+  checkable by anyone holding the authority's pubkey, the signature proves who
+  submitted it.
+
+**Residual, deliberately left:** `treasury_token` is still unconstrained and is
+not in the digest, so the authority (and only the authority) chooses where the
+rake goes. There is no on-chain record of a treasury to pin it against, and
+binding it into the digest would break the digest format this file fixes as a
+Hard Rule. At `ARENA_RAKE_BPS=0` — the default — there is nothing to take.
+**Revisit before rake goes live**, most likely by storing `treasury` on
+`MatchAccount` at `create_match`.
+
+### `pot = vault.amount` is correct here — do not "fix" it
+
+The skill warns against deriving value from a raw balance, and the first instinct
+was to switch to `sum(stakes)`. That warning targets share maths, where a
+donation dilutes other claimants. This is winner-take-all with a single claimant:
+a donor can only hand their own tokens to the winner. Reading the balance also
+keeps the vault self-emptying, which is what lets `close_match` reclaim the rent
+— `sum(stakes)` would strand donations *and* block the close. The rake maths is
+now `checked_mul`/`checked_div` (`overflow-checks` was already on, so this
+converts a settlement-locking panic into a named error).
+
+### `close_match` — new instruction
+
+Nothing ever removed a terminal match, so every match this key created held its
+rent (~0.0084 SOL: a 774-byte `MatchAccount` plus a 165-byte vault ATA) and stayed
+in the sweeper's `getProgramAccounts` scan for the life of the key. `close_match`
+takes a `Settled` or `Cancelled` match with an empty vault, closes the vault via
+CPI and lets Anchor's `close = authority` handle the match account — zeroing,
+reassigning and deallocating, which is what stops a revival attack. Anchor closes
+after the handler returns, so the PDA is still live to sign for its own vault.
+
+The sweeper calls it in a second pass, capped at `MAX_CLOSES_PER_SWEEP` (20) so
+the first sweep after this ships does not fire hundreds of transactions at once.
+A close that fails is logged and skipped, not retried: the realistic cause is a
+donated-into vault, which `cancel_match` leaves non-empty and always will.
+
+### `declare_id!` was still Anchor's placeholder
+
+`Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS` — the well-known example address,
+which does **not** match `target/deploy/arena-keypair.json`. bankrun never
+noticed; a real deploy would have failed every instruction with
+`DeclaredProgramIdMismatch`. Now `4CGRLB5WJ4LK4nqwhzN5uhU78cakuHzG5wfrUZrQ2G64`,
+in both `lib.rs` and `Anchor.toml`. Found because Surfpool needed a real deploy.
+
+### `ArenaError` stayed append-only
+
+6000–6010 are unmoved. Added: `WinnerTokenOwnerMismatch` 6011,
+`InvalidRefundAccount` 6012, `MathOverflow` 6013, `VaultNotEmpty` 6014,
+`MatchNotTerminal` 6015.
+
+## The vendored `solana-dev` skill — and what is deliberately ignored
+
+`.claude/skills/solana-dev/` is a pinned copy of
+[solana-foundation/solana-dev-skill](https://github.com/solana-foundation/solana-dev-skill)
+v2.4.0 (MIT), commit `718f7cd`. Vendored rather than installed so the version is
+fixed, reviewable in the diff and available offline. `VENDOR.md` beside it records
+the provenance and how to update.
+
+**Its stack advice is not followed here, on purpose.** It is Kit-first and
+Anchor-1.1-first; read it for security, concepts and Surfpool, not as a mandate
+to migrate.
+
+| Skill recommends | This project | Why |
+|---|---|---|
+| Anchor 1.1.x | **0.31.1** | See the toolchain section above for how much was burned getting 0.31.1 + Agave 4.2.1 to build at all. Its own matrix calls 0.31.x transitional but functional. Revisit after Phase 3. |
+| `@solana/kit` v7; drop web3.js v1 | **web3.js v1** | `arenaProgram.ts` is hand-rolled precisely to avoid a large client dep, and it ships to the browser. Kit's tree-shaking is a real future win for the 294 kB `wagerJoinFlow` chunk — a spike, not a mandate. |
+| Surfpool instead of bankrun | **bankrun**, plus Surfpool | 42 bankrun tests pin the bindings and the decoder. Surfpool is used for what bankrun cannot do; see `docs/surfpool.md`. |
+| `@solana/react` + Wallet Standard | `client/arena/WalletProvider.ts` | Works. The migration target if wallet support widens. |
+
+Its `W011` rule — validate owner, length and discriminator before deserializing
+anything from chain — is already what `decodeMatchAccount` does. Independent
+confirmation, not a change.
+
+`.mcp.json` adds the Solana MCP server (`https://mcp.solana.com/mcp`, HTTP, no
+auth) at project scope, for Anchor constraint and error questions. Treat its
+answers as documentation, not as authority over this file.
 
 ## ⚠️ Accepted v1 limitation — client-vote winner determination
 **This is a deliberate, accepted risk, not an oversight.**
@@ -256,12 +435,15 @@ documents exactly that format) — it is wrong only against the canonical root p
 which is what it must now match.
 
 ## Current State
-- **Anchor program** (`programs/arena/`): all four instructions implemented —
+- **Anchor program** (`programs/arena/`): five instructions implemented —
   `create_match` (vault is a real PDA-owned ATA), `join_match`, `settle_match`
-  (on-chain ed25519 verified), `cancel_match` (ported, hardened). **Compiles** under the
-  toolchain above; `arena.so` + IDL + types are generated.
-- **Tests**: 31 passing on the program side (`tests/arena.ts` for behaviour,
-  `tests/arenaProgram.ts` for the shared bindings, decoder and settlement), and
+  (on-chain ed25519 verified *and* authority-signed), `cancel_match` (ported,
+  hardened, refund accounts now pinned to `players[]`), `close_match` (rent
+  reclamation). **Compiles** under the toolchain above; `arena.so` + IDL + types
+  are generated, at the real program id rather than Anchor's placeholder.
+- **Tests**: 42 passing on the program side (`tests/arena.ts` for behaviour,
+  `tests/arenaProgram.ts` for the shared bindings, decoder and settlement), 3 more
+  under `npm run test:surfpool` against a really-deployed program, and
   3492 passing on the game side (`npm test` from `OpenFrontIO/`, which runs the
   suite and then re-runs `tests/server`, so those files are counted twice —
   2996 + 496). Includes `tests/ArenaWalletAuth.test.ts` and, under
@@ -369,7 +551,7 @@ dependency order:
 | **H2** | Recovery sweeper (master-only, enumerates by authority) | ✅ ofio `fca7567` |
 | **H4** | Auth service — JWKS, `/auth/refresh`, `/auth/wallet`, `/users/@me` | ✅ ofio `95e4b56` |
 | **H6** | The Oracle Cloud box | todo, needs a domain + region |
-| **3** | Devnet deploy + live validation (S1–S7) | needs H6 |
+| **3** | Devnet deploy + live validation (S1–S7) | needs H6; program-side blockers cleared |
 | **4** | Server-side replay winner determination | **mainnet gate** |
 
 **Phase H is done.** Everything left needs the domain: H6 is the box, and
@@ -509,11 +691,15 @@ why it survives the thing that destroyed the registry: it never reads it.
 - **`MAX_GAME_DURATION_MS` was hoisted** out of `GameServer`'s private field into
   `core/Schemas.ts` so the window is *derived* rather than hand-copied. Two
   copies of "3 hours" is exactly the drift that would reintroduce the bug.
-- **It queries each actionable status separately.** `getProgramAccounts` AND-s
-  its filters and offers no OR, and `cancel_match` sets `Cancelled` without ever
-  closing the account — with no `close` instruction anywhere, that terminal set
-  grows without bound for the life of the authority key. Filtering it out
-  server-side is what keeps a sweep the same size in year two.
+- **It queries one status at a time**, because `getProgramAccounts` AND-s its
+  filters and offers no OR. Four queries now, in two passes: `Open` and
+  `InProgress` are the orphan scan, `Settled` and `Cancelled` are the
+  rent-reclaim pass added with `close_match`. Before that instruction existed the
+  terminal set was filtered out and left to grow for the life of the authority
+  key; now it is actually cleared, capped at `MAX_CLOSES_PER_SWEEP` per tick so
+  the first sweep after it shipped does not fire hundreds of transactions.
+  A close that fails is logged and skipped rather than retried — the realistic
+  cause is a donated-into vault, which is never empty.
 - **Errors are isolated per match**, not per sweep: one unrecoverable pot must
   not strand every other one behind it.
 - `settler.ts`'s refund path was split into **`cancelAndRefund()`**, which takes
@@ -792,6 +978,11 @@ when you add a template variable.
   merges tractable.
 - Checks before declaring done:
   - Program: from WSL, `anchor build && anchor test --skip-deploy --skip-local-validator`
+  - Program, optionally: `npm run test:surfpool` against a local Surfpool with the
+    program deployed — the only way to reach `MATCH_TIMEOUT_SECS`. `docs/surfpool.md`.
+  - **Root `npm` scripts must be run from WSL.** `node_modules` is installed there
+    (`solana-bankrun` is a native NAPI module), so the `.bin` shims are Linux ones
+    and Windows fails with `'ts-mocha' is not recognized`.
   - Game: from `OpenFrontIO/`, `npx tsc --noEmit`, `npm run lint`, **and `npm test`**
     (`vitest run && vitest run tests/server`). Do not skip the vitest run: `en.json`
     additions are checked for **nested** key ordering by `tests/EnJsonSorted.test.ts`,
@@ -805,6 +996,10 @@ when you add a template variable.
     repo's prettier config reorders imports.
   - Changing `programs/arena/` means re-running `anchor build` *before* the tests —
     `tests/arenaProgram.ts` diffs against the generated IDL, so a stale one hides drift.
+- **Security-relevant program changes need a mutation test**, not just a passing
+  one. Break the check on purpose, rebuild, and confirm the test fails; a test
+  that still passes without the fix is not testing the fix. The two that matter
+  most are named in the security section above.
 - The `run-openfront` skill in `OpenFrontIO/.claude/skills/` is written for headless
   Ubuntu + Playwright and does not apply directly on this Windows machine. Use the
   human path: `npm run dev`, then open `http://localhost:9000`.
