@@ -203,10 +203,11 @@ which type-checks via `@types/node` and is simply `undefined` in a browser.
 
 ## 🔴 The security pass — what was wrong, and what now holds it shut
 
-Prompted by vendoring `solana-foundation/solana-dev-skill` (see below) and
-running its `references/security.md` checklist over `programs/arena/`. Found
-before any deploy, so nothing was ever at risk — but every item here would have
-been live the moment Phase 3 put the program on devnet with real tokens.
+Landed as root `f8a2eac`, ofio `0af5e23`. Prompted by vendoring
+`solana-foundation/solana-dev-skill` (see below) and running its
+`references/security.md` checklist over `programs/arena/`. Found before any
+deploy, so nothing was ever at risk — but every item here would have been live
+the moment Phase 3 put the program on devnet with real tokens.
 
 ### The critical one: the ed25519 prelude could be forged by any player
 
