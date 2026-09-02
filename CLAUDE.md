@@ -262,9 +262,11 @@ which is what it must now match.
   toolchain above; `arena.so` + IDL + types are generated.
 - **Tests**: 31 passing on the program side (`tests/arena.ts` for behaviour,
   `tests/arenaProgram.ts` for the shared bindings, decoder and settlement), and
-  3418 passing on the game side (`npm test` from `OpenFrontIO/`, including
-  `tests/ArenaWalletAuth.test.ts` and, under `tests/server/`, `ArenaStartGate`,
-  `AppShellBranding`, `ArenaDevBypass`, `ArenaPreflight` and `ArenaSweeper`).
+  3492 passing on the game side (`npm test` from `OpenFrontIO/`, which runs the
+  suite and then re-runs `tests/server`, so those files are counted twice —
+  2996 + 496). Includes `tests/ArenaWalletAuth.test.ts` and, under
+  `tests/server/`, `ArenaStartGate`, `AppShellBranding`, `ArenaDevBypass`,
+  `ArenaPreflight`, `ArenaSweeper` and `AuthService`.
 - **OpenFrontIO wager integration**: the full stake loop is wired — host creates the
   escrow, every player (host included) stakes into it. Working: `arena/auth.ts` +
   `client/arena/walletAuth.ts` (SIWS-style wallet signature), `matchRegistry`,
@@ -280,6 +282,11 @@ which is what it must now match.
 - **The wager loop is closed end to end**: create escrow → stake → play → pay out,
   and **Stage 6** makes it exercisable locally without the closed-source auth API.
   All six integration stages are done — see the roadmap below for what is not.
+- **Auth service** (`OpenFrontIO/src/auth/`): this fork's replacement for
+  upstream's closed-source JWT issuer — JWKS, `/auth/refresh`, `/users/@me`,
+  wallet login. Stateless, its own process and container at `api.$DOMAIN`.
+  Without it the site can only run as `GAME_ENV=dev`. See
+  `OpenFrontIO/docs/Auth.md`.
 - Wagering is inert unless `ARENA_PROGRAM_ID` is set.
 - **Never run against mainnet in this state.** Beyond the client-vote risk below, none
   of this has been exercised against a live cluster — every proof so far is bankrun.
@@ -360,13 +367,93 @@ dependency order:
 | **H3** | Program: timeout-cancel for a stranded `InProgress` match | ✅ root `552425c` |
 | **H1** | Arena env vars + keypair mount + boot preflight | ✅ ofio `f1b3832` |
 | **H2** | Recovery sweeper (master-only, enumerates by authority) | ✅ ofio `fca7567` |
-| **H4** | Auth service — JWKS, `/auth/refresh`, `/auth/wallet`, `/users/@me` | todo |
+| **H4** | Auth service — JWKS, `/auth/refresh`, `/auth/wallet`, `/users/@me` | ✅ ofio `95e4b56` |
 | **H6** | The Oracle Cloud box | todo, needs a domain + region |
-| **3** | Devnet deploy + live validation (S1–S7) | needs H3 first |
+| **3** | Devnet deploy + live validation (S1–S7) | needs H6 |
 | **4** | Server-side replay winner determination | **mainnet gate** |
 
-**H4 (the auth service) is the next unblocked item** — and the last thing in
-Phase H that does not need the domain. H6 waits on it.
+**Phase H is done.** Everything left needs the domain: H6 is the box, and
+Phase 3's live validation runs on it.
+
+### H4 — the auth service (done)
+
+Upstream's JWT issuer is a **closed-source Cloudflare Worker that is not in the
+repo**, so this fork could only ever run as `GAME_ENV=dev`: `verifyClientToken`
+refuses a bare persistentID outside dev, `ServerEnv.jwkPublicKey()` throws with
+no JWKS to fetch, and `Worker.ts` closes the socket when `/users/@me` fails.
+`OpenFrontIO/src/auth/` replaces the auth half of it. Full detail in
+`OpenFrontIO/docs/Auth.md`; the notes worth keeping:
+
+- **It has no database, and that is the design.** Upstream's API is backed by
+  accounts, subscriptions, cosmetics and clans; this fork has none, so every
+  field `/users/@me` returns is derived from the session or is an operator
+  constant. A guest's identity lives in its refresh cookie; a wallet's is
+  *derived* from the address, so the same wallet is the same player everywhere
+  with nothing stored and no reverse lookup to leak. Same posture as the H2
+  sweeper, which survives a crash precisely by keeping no server-side state.
+- **The stated cost:** with no store there is no revocation list.
+  `/auth/revoke` can only clear the cookie, so an issued access token stays
+  valid for up to its 15-minute life. Closing that needs storage.
+- **The three token kinds are separated by `aud`, not by a hand-written check** —
+  access → `$DOMAIN`, refresh → `<issuer>/auth/refresh`, challenge →
+  `<issuer>/auth/wallet`. `jwtVerify` enforces the audience itself, so a refresh
+  cookie replayed as a bearer token fails *verification* rather than depending
+  on a guard someone might later drop. Tests assert each direction.
+- **A cookieless `/auth/refresh` mints a new guest rather than failing.** It is
+  the browser's only guest path (`Auth.ts`'s `doRefreshJwt` falls through to
+  it), so a 401 would leave a first-time visitor with no session at all — and
+  would make `Auth.ts` log out and clear their flag and pattern settings. It is
+  also why that route is rate limited: each cookieless call creates an identity.
+- **`iss` is pinned, not configured.** `ServerEnv.jwtIssuer()` and
+  `ClientEnv.jwtIssuer()` each *compute* `https://api.$DOMAIN` (or
+  `http://localhost:8787`) and reject anything else, so `AUTH_PORT` deliberately
+  does not feed the issuer — `warnIfPortMismatch()` says so at boot.
+- **The signing key is never auto-generated for a configured path.** A container
+  minting one per start would invalidate every session on each deploy, and the
+  game server caches the first JWKS response for the life of its process, so it
+  would keep rejecting tokens until it too restarted. Outside dev the service
+  **refuses to boot** without `AUTH_SIGNING_KEY_PATH`; in dev it generates an
+  ephemeral key and says so loudly. `scripts/generateAuthKey.ts` writes it once,
+  mode 600, and refuses to overwrite.
+- **`src/auth/` must not import `src/server/`.** `ServerEnv` throws for vars the
+  auth service has no business setting (`NUM_WORKERS`, `GIT_COMMIT`,
+  `TURNSTILE_SITE_KEY`) and `server/Logger.ts` wires OpenTelemetry at import
+  time — either would make the service unable to boot alone. It shares only
+  `src/core/`, which is the point: `TokenPayloadSchema` and
+  `UserMeResponseSchema` are literally the same module on both ends. That is
+  also why `verifyEd25519Signature()` was extracted to
+  `core/arena/walletSignature.ts` rather than copied.
+- **Wallet login uses a different signed message from the per-match one.**
+  `walletLoginMessage()` sits beside `authMessage()` in
+  `core/arena/authMessage.ts` with a distinct prefix, so a captured match
+  signature can never be replayed as a login. A test signs `authMessage(nonce)`
+  against `/auth/wallet` and asserts a 401 — that is what fails if the prefixes
+  are ever unified.
+- **Wallet login is server-side only for now.** The arena verifies wallet
+  ownership per match on its own, so nobody needs it to stake, and a browser
+  sign-in would change a player's persistentID mid-session.
+- **`npm run dev` is unchanged**; `npm run dev:auth` runs client + game server +
+  auth, which is how a real `jti` (and therefore the real wallet-signing nonce)
+  gets exercised locally instead of `devAuthNonce()`.
+- **`tests/server/AuthService.test.ts` runs under `// @vitest-environment node`.**
+  The repo default is jsdom, whose `TextEncoder` is a different realm — jose and
+  tweetnacl both type-check with `instanceof`, so every sign() fails there with
+  "payload must be an instance of Uint8Array". The service only ever runs in
+  Node anyway.
+- `ServerEnv`'s `JwksSchema` is now **exported**, so the suite pins the auth
+  service's JWKS against the schema the game server actually enforces rather
+  than a copy of it. A JWKS the game refuses breaks every join.
+
+### H1's `update.sh` half had never landed — corrected here
+
+`update.sh` expanded `"${ARENA_MOUNT[@]}"` but **nothing ever defined the
+array**: `git log -S ARENA_MOUNT -- update.sh` shows `f1b3832` added only the
+one-line reference. The keypair mount, the `SERVER_KEYPAIR_PATH` append, the
+refusal on a missing source file and the `RESTART=always` forcing were all
+absent, and with `set -eo pipefail` (no `-u`) the expansion silently produced
+nothing — so a deploy quietly built a **free-to-play server**, the exact failure
+H1's commit message claims to have fixed. All four are now in the file, next to
+the same mechanism the auth signing key needed.
 
 ### H1 — the arena now reaches a real deployment (done)
 Three things were missing between the code and a deployed container:
@@ -661,6 +748,11 @@ Two things will otherwise waste an afternoon:
 - **Wagering needs a deployed program**, a funded `SERVER_KEYPAIR_PATH`, and
   `ARENA_PROGRAM_ID` set. With `ARENA_PROGRAM_ID` empty the host UI hides the stake
   control and every lobby stays free — which is the correct default, not a failure.
+- **`npm run dev:auth` gets you a real `jti` locally.** Since H4 the fork has its
+  own JWT issuer, so a dev session can hold a genuine JWT instead of a bare
+  persistentID — the wallet signature then binds to a session rather than falling
+  back to `devAuthNonce()`. `npm run dev` is unchanged and still uses the
+  anonymous path.
 
 ## Hosting this fork — three licences, and none of them are optional
 Landed in Phase H5 (`OpenFrontIO` `8a9ab4d`). Details in
@@ -738,6 +830,24 @@ when you add a template variable.
   cluster's genesis hash proves it is not mainnet; refused if the RPC is unreachable.
 - `ARENA_MAX_ENTRY_FEE` — ceiling on one seat's stake, in token base units. Empty
   means no ceiling. Operator-set, never host-set.
+- `AUTH_SIGNING_KEY_PATH` — the auth service's Ed25519 private JWK. **Refuses to
+  boot outside dev when unset**; dev generates an ephemeral key. Never
+  auto-created for a configured path — see H4 above.
+- `AUTH_SIGNING_KEY` — **deploy only**, path to that key *on the target host*.
+  `update.sh` bind-mounts it read-only and sets `AUTH_SIGNING_KEY_PATH` itself.
+  Setting it is also what makes the deploy start an auth container at all.
+- `AUTH_PORT` — auth service listen port, default 8787. Does **not** change the
+  issuer, which both the game server and the browser compute themselves.
+- `AUTH_COOKIE_DOMAIN` / `AUTH_COOKIE_SECURE` — refresh-cookie attributes. Empty
+  domain means host-only (`api.$DOMAIN`), which is the only reader; `Secure`
+  defaults on outside dev.
+- `AUTH_ALLOW_PUBLIC_LOBBIES` — whether `/users/@me` reports
+  `canCreatePublicLobbies`. Upstream gates it on a subscription; this fork has
+  no subscription backend, so it is the operator's call. Wagered lobbies stay
+  private-only regardless.
+- `AUTH_ALLOWED_ORIGINS` — extra origins allowed to send credentialed auth
+  requests. `https://$DOMAIN`, its subdomains and dev localhost are allowed
+  without listing.
 - `SITE_NAME` — public display name, used for `og:title`. Falls back to `DOMAIN`.
 - `SOURCE_REPO_URL` — where **this** deployment's source lives. Drives the footer
   link. **Unset is an AGPL problem, not a cosmetic one** — see below. The master
