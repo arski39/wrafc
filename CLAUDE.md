@@ -873,12 +873,23 @@ default:
 | Custodial Privy wallets | Non-custodial Phantom | Hard Rule: the server never holds user funds. |
 | 10% fee on withdrawal | `rake_bps` at settlement | And the `treasury_token` residual is still open — see the security section. |
 
+**Done:** `WagerLobby.ts` is now light-DOM Tailwind on the design tokens, using
+`o-button` like everything else. It was the last shadow-DOM island in the
+codebase, with a hand-written `#1a1a2e`/`#e94560` palette that matched nothing —
+and the shadow boundary was *why* it missed every token. It is also pot-first
+now: the headline is what the winner actually takes (net of rake), because that
+is the number that decides whether someone plays, not the row of labels it used
+to lead with. The mint stays on screen beside the symbol, deliberately —
+`ARENA_STAKE_SYMBOL` is an operator string, not on-chain metadata, so the ticker
+alone is an unverifiable claim. `tests/client/WagerLobby.test.ts` is the first
+thing ever to render this component; it pins the formatting and the light DOM,
+and is mutation-checked both ways.
+
 Designed but deliberately **not built**: a tier lobby browser (three cards
-showing live lobbies at each stake with pot, joined/max and countdown), a
-quick-join queue per tier, and folding `WagerLobby.ts` into the design system —
-it is the only shadow-DOM, non-Tailwind, non-token component left. Note that a
-joining player currently sees no lobby preview at all before staking, because the
-gate runs before `joinLobby()`.
+showing live lobbies at each stake with pot, joined/max and countdown) and a
+quick-join queue per tier — both gated on Phase 4. Note also that a joining
+player currently sees no lobby preview at all before staking, because the gate
+runs before `joinLobby()`; a tier browser should fix that.
 
 **When that ships, the flag must not be a bare boolean.** `PublicGameInfoSchema`
 would need a wager field, and `ARENA_PUBLIC_WAGER_LOBBIES` must be honoured only
