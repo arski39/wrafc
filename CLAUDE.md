@@ -460,10 +460,11 @@ vote and two tests fail.
 
 ### What this does and does not unlock
 
-It removes the collusion surface that kept wagered lobbies private-only, so the
-DamnBruh-style **public tier queue is now unblocked** — see the lobby direction
-section, including the rule that `ARENA_PUBLIC_WAGER_LOBBIES` must be gated on
-verification actually being available rather than being a bare boolean.
+It removed the collusion surface that kept wagered lobbies private-only, and
+that unblocking has since been taken up: wagered lobbies can be listed in the
+public browser behind `ARENA_PUBLIC_WAGER_LOBBIES`. See the lobby direction
+section — the flag is honoured only once a verification has actually succeeded
+on that process, which is a use of this phase, not merely a claim about it.
 
 It does **not** by itself make mainnet safe. Nothing here has run against a live
 cluster; Phase 3's devnet validation still comes first, and the `treasury_token`
@@ -529,11 +530,12 @@ which is what it must now match.
 - **Tests**: 42 passing on the program side (`tests/arena.ts` for behaviour,
   `tests/arenaProgram.ts` for the shared bindings, decoder and settlement), 3 more
   under `npm run test:surfpool` against a really-deployed program, and
-  3492 passing on the game side (`npm test` from `OpenFrontIO/`, which runs the
+  3722 passing on the game side (`npm test` from `OpenFrontIO/`, which runs the
   suite and then re-runs `tests/server`, so those files are counted twice —
-  2996 + 496). Includes `tests/ArenaWalletAuth.test.ts` and, under
+  3118 + 604). Includes `tests/ArenaWalletAuth.test.ts` and, under
   `tests/server/`, `ArenaStartGate`, `AppShellBranding`, `ArenaDevBypass`,
-  `ArenaPreflight`, `ArenaSweeper` and `AuthService`.
+  `ArenaPreflight`, `ArenaSweeper`, `ArenaReplayVerifier`, `ArenaReplayProbe`,
+  `ArenaPublicLobbies` and `AuthService`.
 - **OpenFrontIO wager integration**: the full stake loop is wired — host creates the
   escrow, every player (host included) stakes into it. Working: `arena/auth.ts` +
   `client/arena/walletAuth.ts` (SIWS-style wallet signature), `matchRegistry`,
@@ -840,8 +842,8 @@ anywhere real, that was dev mode moving real tokens.
   per-process, and the master needs it too because it renders the app shell.
 
 ### `ARENA_MAX_ENTRY_FEE` — the stake cap that did not exist
-The accepted-risk section below says not to raise stake limits while the winner is
-client-voted. There was no limit to raise: `POST /:id/wager` accepted any non-zero
+Written when the winner was still client-voted and the rule was "do not raise
+stake limits". There was no limit to raise: `POST /:id/wager` accepted any non-zero
 u64, and the program bounds `rake_bps` and `max_players` but leaves `entry_fee`
 unbounded. Same shape as the Phase 1 start-gate — a documented rule with nothing
 behind it.
@@ -883,9 +885,9 @@ shape gets a 400 for a missing `tier`.
   so `stakeMint.ts` logs which tiers it took the cap to mean. A cap that
   suppresses *every* tier is refused at boot.
 - **Tier 25 at 16 players is a 400-token pot**, and `maxPlayers` is still
-  host-chosen. The accepted-risk section says not to raise stake limits while the
-  winner is client-voted, and a small or 1v1 wagered lobby is the easiest place
-  to collude — `example.env` suggests suppressing 25 until Phase 4.
+  host-chosen. Phase 4 removed the reason this was alarming — the winner is no
+  longer whatever a colluding majority claims — but the cap is still the only
+  ceiling on what one lobby can put at stake, and it is worth setting.
 
 ### `arena/stakeMint.ts` — the staking token, resolved at boot
 
@@ -948,12 +950,12 @@ until one does.
 
 The direction is [DamnBruh](https://www.damn-bruh.com/): fixed tiers, real-time
 matchmaking that pairs players **by stake level**, a pot-first presentation.
-Three parts of that model do **not** transfer, and must not be adopted by
-default:
+Two parts of that model do **not** transfer at all, and the third only transfers
+under a condition that has to be proved rather than configured:
 
 | DamnBruh | Here | Why |
 |---|---|---|
-| Public tier matchmaking | **Private lobbies only** | The winner is decided by client-majority vote. A public tier queue is the easiest possible collusion surface. **Phase 4 is the gate.** |
+| Public tier matchmaking | **Listed lobbies, gated on verification** | Was private-only while the winner came from a client-majority vote. Phase 4 removed that, and `ARENA_PUBLIC_WAGER_LOBBIES` now opens it — see below for why the flag is not a boolean. |
 | Custodial Privy wallets | Non-custodial Phantom | Hard Rule: the server never holds user funds. |
 | 10% fee on withdrawal | `rake_bps` at settlement | And the `treasury_token` residual is still open — see the security section. |
 
@@ -969,19 +971,71 @@ alone is an unverifiable claim. `tests/client/WagerLobby.test.ts` is the first
 thing ever to render this component; it pins the formatting and the light DOM,
 and is mutation-checked both ways.
 
-Designed but deliberately **not built**: a tier lobby browser (three cards
-showing live lobbies at each stake with pot, joined/max and countdown) and a
-quick-join queue per tier — both gated on Phase 4. Note also that a joining
-player currently sees no lobby preview at all before staking, because the gate
-runs before `joinLobby()`; a tier browser should fix that.
+### ✅ Public wagered lobbies — the flag is not a boolean
 
-**When that ships, the flag must not be a bare boolean.** `PublicGameInfoSchema`
-would need a wager field, and `ARENA_PUBLIC_WAGER_LOBBIES` must be honoured only
-when server-side winner verification is actually available — checked at boot,
-failing closed, exactly the shape of `resolveDevBypass()` refusing to trust
-`ARENA_DEV_BYPASS=true` until it has asked the cluster for its genesis hash. A
-dormant public-lobby path guarded only by operator discipline is a collusion
-surface one edit away from being live.
+**Done** (ofio `92d88f3`). Phase 4 was the stated gate and it is cleared,
+so a wagered lobby may now be advertised in the public browser. What ships is
+the **tier browser**, not a matchmaking queue: a host's own lobby, listed, with
+its stake on the card. Quick-join per tier is still not built.
+
+**`ARENA_PUBLIC_WAGER_LOBBIES=true` is a request, not a decision.** The server
+honours it only after a replay verification has actually succeeded on that
+process — `arena/replayProbe.ts` plays a short match on the smallest shipped map
+and re-derives it through the **production** verifier. Same posture as
+`resolveDevBypass()` refusing to trust its own env var until it has asked the
+cluster for its genesis hash, and for the same kind of reason: the env var
+records an intention, and what matters is a fact about this deployment.
+
+The fact worth checking is narrow and real. A verification that cannot run —
+map data missing from the image, the worker thread unable to load its own
+TypeScript — makes every wagered match refuse to settle and refund on the 24h
+timeout. Neither failure is visible to tsc, and neither surfaces until a match
+ends. A public queue on top of that recruits strangers into lobbies that can
+only ever refund. So: probe fails → private-only, with the reason logged.
+
+Notes that will not be re-derivable from the diff:
+
+- **The probe costs two worker threads, and needs both.** One simulation per
+  process (see Phase 4 above), so recording and verifying cannot share a module
+  registry — hence `replayProbeWorker.ts` beside `replayWorker.ts` rather than a
+  `mode` flag on the latter. Measured at ~1.4 s for the pair, and it only runs
+  when the flag was requested.
+- **Resolved per worker, not in the master.** The gate is read by `/listing` and
+  `/wager`, which only workers serve, and verification runs in the worker that
+  owns the game — so a per-worker proof is the real thing rather than an
+  approximation of it. The master needs nothing from this.
+- **The two endpoint refusals are one pair, tested together.** A host reaches a
+  listed wagered lobby two ways — wager then list, or list then wager — so a gate
+  on one is an ordering puzzle, not a restriction. `listingRefusedForWager()` and
+  `wagerRefusedForVisibility()` live side by side in `publicLobbies.ts` for that
+  reason. A matchmaking lobby (`isPublic()`) stays unwagerable whatever the gate
+  says: nobody in it staked and there is no host to create the escrow.
+- **`PublicGameInfoSchema` carries a summary, not a `WagerInfo`.** Entry fee,
+  max players, decimals, rake and symbol — no `matchPDA`, `vault`, `programId`
+  or `rpcUrl`. That payload reaches every browser watching the lobby list,
+  repeatedly, for lobbies nobody has clicked; a player who actually joins fetches
+  the full thing from `GET /api/game/:id` on the way in.
+- **`winnerPayout()` moved into `core/arena/stakeTiers.ts`.** The lobby card and
+  the stake prompt now share one implementation. A card promising more than the
+  prompt charges is not reported as a bug — people just stop trusting the number.
+- **The card renders the amount as data, outside the translated string.** A
+  missing or malformed translation must not be able to hide what a seat costs,
+  and it also makes the row assertable without standing up `<lang-selector>`.
+- **This closes the no-preview-before-staking gap.** The stake gate runs ahead
+  of `joinLobby()`, so a joining player used to meet a wallet prompt as the first
+  thing they saw; the row now shows the pot and the seat price before anyone
+  clicks. Joins from the browser route
+  through the same stake gate as a pasted lobby id — `JoinLobbyModal` dispatches
+  `join-lobby` with `source: "private"` for both, which is what
+  `Main.resolveWagerJoin` keys on. Worth not breaking.
+
+Still **not built**: quick-join matchmaking per tier, which is the part of
+DamnBruh's model that pairs strangers automatically rather than listing what
+hosts happen to have made.
+
+Mutation-checked twice: drop the probe requirement and
+`REFUSES when the server cannot actually verify` fails; drop the gate from
+`listingRefusedForWager` and `refuses both orders while the gate is off` fails.
 
 ### H3 — the `InProgress` escape hatch (done, and why it matters)
 `settle_match` accepts only `InProgress`; `cancel_match` used to accept only
@@ -1028,8 +1082,10 @@ Kept for the constraints they record, not as remaining work.
    - `createWageredMatch` has **no dev-mode shortcut on purpose**. Registering a lobby
      as wagered without a real escrow would advertise a stake nobody can win, so it
      throws instead and the lobby stays free-to-play.
-   - Wagered lobbies are private-only, enforced in *both* directions: `/wager` rejects a
-     listed lobby and `/listing` rejects a wagered one.
+   - Wagered lobbies were private-only, enforced in *both* directions: `/wager`
+     rejected a listed lobby and `/listing` rejected a wagered one. Both
+     refusals are still there but are now conditional — see the public wagered
+     lobbies section. They remain a pair, and must stay one.
    - `settler.ts`'s duplicate keypair loader was removed in favour of
      `arena/serverKeypair.ts`, which is now the single place the authority key is read.
 3. ~~**Client on-chain join** — `onchainJoin.ts`'s `join_match` submission;
@@ -1334,6 +1390,11 @@ cannot leak past dev: `createHtmlPlugin` is only registered when
   means no ceiling. Operator-set, never host-set. Now also **filters which of the
   1/5/25 tiers are offered**, and its meaning depends on the mint's decimals —
   the boot log says which tiers it was taken to mean.
+- `ARENA_PUBLIC_WAGER_LOBBIES` — whether a wagered lobby may be listed in the
+  public browser. **Default off, and not a plain boolean:** setting it true is a
+  request the server honours only after a replay verification has actually
+  succeeded on that worker at boot. A deployment that cannot verify keeps
+  wagered lobbies private and logs the reason.
 - `AUTH_SIGNING_KEY_PATH` — the auth service's Ed25519 private JWK. **Refuses to
   boot outside dev when unset**; dev generates an ephemeral key. Never
   auto-created for a configured path — see H4 above.
@@ -1347,8 +1408,9 @@ cannot leak past dev: `createHtmlPlugin` is only registered when
   defaults on outside dev.
 - `AUTH_ALLOW_PUBLIC_LOBBIES` — whether `/users/@me` reports
   `canCreatePublicLobbies`. Upstream gates it on a subscription; this fork has
-  no subscription backend, so it is the operator's call. Wagered lobbies stay
-  private-only regardless.
+  no subscription backend, so it is the operator's call. Listing a *wagered*
+  lobby additionally needs `ARENA_PUBLIC_WAGER_LOBBIES` and a verification that
+  actually passed; this flag alone does not open one.
 - `AUTH_ALLOWED_ORIGINS` — extra origins allowed to send credentialed auth
   requests. `https://$DOMAIN`, its subdomains and dev localhost are allowed
   without listing.
