@@ -768,6 +768,126 @@ denominated without the mint's decimals. A malformed value **throws** rather tha
 defaulting to "no cap" — a typo'd ceiling that silently means unlimited is exactly
 the failure being prevented.
 
+### Fixed stake tiers — 1 / 5 / 25, and one operator-set token
+
+Hosts no longer type an amount or a mint. They pick a **tier** — 1, 5 or 25
+whole units of `ARENA_STAKE_MINT` — and the server derives everything else.
+Product direction from DamnBruh (fixed $1/$5/$20 lobbies), but the mechanism is
+chosen for a security property:
+
+> The server derives `entry_fee` from the tier. The client never sends an
+> amount. So an off-tier stake is not *rejected*, it is **unrepresentable**.
+
+Same reasoning as gating a wagered start on the escrow reporting `InProgress`
+rather than on a seat count: a check that cannot drift from the rule it
+enforces. `POST /api/game/:id/wager` now takes `{ tier, maxPlayers }`; `mint`
+and `entryFee` are gone from the wire entirely, and a client sending the old
+shape gets a 400 for a missing `tier`.
+
+- **`STAKE_TIERS` lives in `core/arena/stakeTiers.ts`, which imports nothing.**
+  Not even Zod — the root bankrun suite reaches across into `OpenFrontIO/` and
+  can only do that for modules free of OpenFrontIO imports and Node built-ins,
+  and Zod is not a root dependency. `Worker.ts` builds its validation *from* the
+  array rather than hand-writing a literal union, which would be exactly the
+  drift this is meant to prevent.
+- **A drifted client copy cannot create a wrong escrow.** It can only offer a
+  tier the server refuses. The shared list is for rendering; the derivation has
+  one implementation.
+- **`ARENA_MAX_ENTRY_FEE` filters the tiers** rather than getting a parallel
+  `ARENA_MAX_STAKE_TIER` beside it — one cap knob. Its meaning now depends on
+  the mint's decimals (the same number is tier 5 at 6 decimals and 0.005 at 9),
+  so `stakeMint.ts` logs which tiers it took the cap to mean. A cap that
+  suppresses *every* tier is refused at boot.
+- **Tier 25 at 16 players is a 400-token pot**, and `maxPlayers` is still
+  host-chosen. The accepted-risk section says not to raise stake limits while the
+  winner is client-voted, and a small or 1v1 wagered lobby is the easiest place
+  to collude — `example.env` suggests suppressing 25 until Phase 4.
+
+### `arena/stakeMint.ts` — the staking token, resolved at boot
+
+Shaped after `devBypass.ts`, **not** folded into `preflight.ts`'s `Preflight`
+union. `Preflight` is a verdict type and `runWagerPreflight()`'s return value is
+discarded at both call sites, so widening its `ok` variant would quietly make it
+load-bearing where nobody reads it. A lazily self-resolving accessor would put
+an `await` back on the request path that H1 removed, and a module-scope memo
+would re-create the master/worker dotenv trap — so env is read *inside*
+`resolveStakeMint()`. `stakeMint()` reads null until resolution succeeds, the
+same fail-closed posture as `wageringOperational()`.
+
+What it refuses at boot, and why each one matters:
+
+- **Not owned by the legacy SPL Token program.** The arena pins
+  `Program<'info, Token>`, so a **Token-2022 mint can never be escrowed** —
+  previously that surfaced as a failed `create_match` on a lobby the host had
+  already set up. Mutation-checked. It also means transfer-fee and transfer-hook
+  extensions cannot apply here, which is worth writing down so nobody
+  re-derives it as a risk.
+- **Uninitialized.** An uninitialized 82-byte account decodes as `decimals = 0`,
+  which would silently turn every tier into 1/5/25 *base units* — a stake of
+  0.000001 tokens that looks entirely normal.
+- **More than 9 decimals.** Not arbitrary: `25 * 10^18` overflows a u64, and
+  `u64LE()` throws inside `buildCreateMatchIx`, so a high-decimals mint would be
+  a **502 on a live lobby**. The arithmetic ceiling is 17; 9 is deliberately
+  stricter (SOL is 9, USDC is 6). Raising it past 17 is a correctness bug, not a
+  policy change.
+- **A freeze authority is warned about, not refused.** Picking one mint for the
+  whole deployment turns a per-lobby risk into a global one: a frozen vault or
+  player token account fails **both** `settle_match` and `cancel_match`, and H3's
+  timeout does not help because it is the transfer itself that fails. Whether
+  that is acceptable is the operator's call.
+
+**`TREASURY_TOKEN_ACCOUNT` is finally checked.** `example.env` always said it
+must hold the same mint the match is staked in; nothing enforced it — the same
+documented-rule-with-nothing-behind-it shape as the Phase 1 start gate and the
+stake cap. A mismatch fails `settle_match`'s rake CPI, which fails the whole
+settlement and strands the pot until the 24h timeout. Only checkable now that the
+server knows the mint at boot. Mutation-checked.
+
+**Amounts are formatted everywhere now.** `formatStake()` does BigInt string
+surgery and **never touches `Number`** — `entryFee` crosses the wire as a string
+precisely because a u64 loses precision above 2^53, and parsing it back to a
+float to divide would reintroduce exactly that. A prompt reading `5000000` where
+the host chose "5" is how someone stakes the wrong amount believing they checked.
+
+`WagerConfig` records `decimals` and `symbol` **per match**, for the same reason
+it records `programId`: it makes `toWagerInfo()` a pure function of the config
+rather than a reader of current global state. Do not "simplify" `WagerConfig.mint`
+to a `stakeMint()` call — `verifyOnchainMembership` compares the on-chain match's
+mint against that value, so an operator who repointed the token would kick every
+player of every live match.
+
+**`wagerOptions` is separate from `wager` on `GET /api/game/:id`** because the
+host picks a tier *before* any escrow exists, and `wager` is per-match and absent
+until one does.
+
+### Where the lobby UI is going — DamnBruh, and what of it does not apply
+
+The direction is [DamnBruh](https://www.damn-bruh.com/): fixed tiers, real-time
+matchmaking that pairs players **by stake level**, a pot-first presentation.
+Three parts of that model do **not** transfer, and must not be adopted by
+default:
+
+| DamnBruh | Here | Why |
+|---|---|---|
+| Public tier matchmaking | **Private lobbies only** | The winner is decided by client-majority vote. A public tier queue is the easiest possible collusion surface. **Phase 4 is the gate.** |
+| Custodial Privy wallets | Non-custodial Phantom | Hard Rule: the server never holds user funds. |
+| 10% fee on withdrawal | `rake_bps` at settlement | And the `treasury_token` residual is still open — see the security section. |
+
+Designed but deliberately **not built**: a tier lobby browser (three cards
+showing live lobbies at each stake with pot, joined/max and countdown), a
+quick-join queue per tier, and folding `WagerLobby.ts` into the design system —
+it is the only shadow-DOM, non-Tailwind, non-token component left. Note that a
+joining player currently sees no lobby preview at all before staking, because the
+gate runs before `joinLobby()`.
+
+**When that ships, the flag must not be a bare boolean.** `PublicGameInfoSchema`
+would need a wager field, and `ARENA_PUBLIC_WAGER_LOBBIES` must be honoured only
+when server-side winner verification is actually available — checked at boot,
+failing closed, exactly the shape of `resolveDevBypass()` refusing to trust
+`ARENA_DEV_BYPASS=true` until it has asked the cluster for its genesis hash. A
+dormant public-lobby path guarded only by operator discipline is a collusion
+surface one edit away from being live.
+
 ### H3 — the `InProgress` escape hatch (done, and why it matters)
 `settle_match` accepts only `InProgress`; `cancel_match` used to accept only
 `Open`. A lobby that filled and then lost its server therefore had **no on-chain
@@ -1108,8 +1228,17 @@ cannot leak past dev: `createHtmlPlugin` is only registered when
 - `ARENA_DEV_BYPASS` — **dev only, default off.** Skips the wallet-signature session
   binding and the on-chain stake check. Only honoured when `GAME_ENV=dev` **and** the
   cluster's genesis hash proves it is not mainnet; refused if the RPC is unreachable.
+- `ARENA_STAKE_MINT` — the SPL token every stake is denominated in. **Required
+  once `ARENA_PROGRAM_ID` is set.** Verified at boot: must exist, be owned by the
+  **legacy** Token program (Token-2022 can never be escrowed), be initialized,
+  and declare at most 9 decimals.
+- `ARENA_STAKE_SYMBOL` — display-only ticker, max 12 of `[A-Za-z0-9._-]`. An
+  operator claim rather than on-chain metadata, which is why the mint address
+  stays visible beside it in the stake prompt.
 - `ARENA_MAX_ENTRY_FEE` — ceiling on one seat's stake, in token base units. Empty
-  means no ceiling. Operator-set, never host-set.
+  means no ceiling. Operator-set, never host-set. Now also **filters which of the
+  1/5/25 tiers are offered**, and its meaning depends on the mint's decimals —
+  the boot log says which tiers it was taken to mean.
 - `AUTH_SIGNING_KEY_PATH` — the auth service's Ed25519 private JWK. **Refuses to
   boot outside dev when unset**; dev generates an ephemeral key. Never
   auto-created for a configured path — see H4 above.

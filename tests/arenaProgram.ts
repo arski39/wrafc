@@ -42,6 +42,7 @@ import {
   MATCH_ACCOUNT_LAYOUT,
   MATCH_ACCOUNT_SIZE,
   MATCH_TIMEOUT_SECS,
+  MINT_ACCOUNT_SIZE,
   MAX_PLAYERS,
   MAX_RAKE_BPS,
   MatchStatus,
@@ -54,11 +55,14 @@ import {
   buildJoinMatchIx,
   buildSettleMatchIx,
   decodeMatchAccount,
+  decodeMintAccount,
+  decodeTokenAccount,
   deriveAta,
   deriveMatchPda,
   deriveVaultAta,
   settleMessagePreimage,
 } from "../OpenFrontIO/src/core/arena/arenaProgram";
+import { entryFeeForTier } from "../OpenFrontIO/src/core/arena/stakeTiers";
 
 import idlJson from "../target/idl/arena.json";
 
@@ -616,6 +620,124 @@ describe("arenaProgram bindings", () => {
       assert.throws(
         () => decodeMatchAccount(badStatus, programId, programId),
         /unknown MatchStatus/,
+      );
+    });
+
+    // [ARENA] The staking mint. Stakes are denominated in fixed tiers now, and
+    // a tier is meaningless without a mint's decimals — so the server decodes
+    // one at boot. Exercised against a mint the token program actually created,
+    // not a fixture that merely round-trips, which is the same "(2) executed
+    // against the real program" half that pins decodeMatchAccount.
+    it("decodeMintAccount reads a real mint the token program created", async () => {
+      const rent = await context.banksClient.getRent();
+
+      for (const decimals of [0, 6, 9]) {
+        const kp = Keypair.generate();
+        await sendTx(
+          [
+            SystemProgram.createAccount({
+              fromPubkey: authority.publicKey,
+              newAccountPubkey: kp.publicKey,
+              space: MINT_SIZE,
+              lamports: Number(rent.minimumBalance(BigInt(MINT_SIZE))),
+              programId: TOKEN_PROGRAM_ID,
+            }),
+            createInitializeMint2Instruction(
+              kp.publicKey,
+              decimals,
+              authority.publicKey,
+              // A freeze authority on alternating mints, so the flag the
+              // operator gets warned about is actually observed both ways.
+              decimals === 6 ? authority.publicKey : null,
+            ),
+          ],
+          [authority, kp],
+        );
+
+        const raw = await context.banksClient.getAccount(kp.publicKey);
+        assert.equal(
+          raw!.data.length,
+          MINT_ACCOUNT_SIZE,
+          "a legacy SPL mint is exactly 82 bytes",
+        );
+        const view = decodeMintAccount(
+          Uint8Array.from(raw!.data),
+          new PublicKey(raw!.owner),
+        );
+        assert.equal(view.decimals, decimals);
+        assert.equal(view.hasFreezeAuthority, decimals === 6);
+
+        // The derivation the server does, end to end against a real mint.
+        assert.equal(
+          entryFeeForTier(5, view.decimals),
+          BigInt(5) * 10n ** BigInt(decimals),
+        );
+      }
+    });
+
+    it("decodeMintAccount refuses accounts it should not trust", async () => {
+      const raw = await context.banksClient.getAccount(mintKp.publicKey);
+      const data = Uint8Array.from(raw!.data);
+
+      // The load-bearing one, twice over: without it any 82-byte account
+      // decodes into a plausible mint, AND a Token-2022 mint — which the
+      // program can never escrow, since it pins Program<Token> — would be
+      // accepted at boot and fail later on a live lobby.
+      assert.throws(
+        () => decodeMintAccount(data, SystemProgram.programId),
+        /not the SPL Token program/,
+      );
+
+      assert.throws(
+        () => decodeMintAccount(data.subarray(0, 40), TOKEN_PROGRAM_ID),
+        /expected 82 bytes/,
+      );
+
+      // An uninitialized mint decodes as decimals = 0, which would silently
+      // turn every tier into 1/5/25 base units.
+      const uninitialized = Uint8Array.from(data);
+      uninitialized[45] = 0;
+      assert.throws(
+        () => decodeMintAccount(uninitialized, TOKEN_PROGRAM_ID),
+        /not initialized/,
+      );
+    });
+
+    it("decodeTokenAccount reads the mint out of a real ATA", async () => {
+      // What preflight uses to check TREASURY_TOKEN_ACCOUNT really holds the
+      // staking mint — an unenforced documented rule until now, and a mismatch
+      // fails settle_match's rake transfer and strands the pot.
+      const holder = Keypair.generate();
+      context.setAccount(holder.publicKey, {
+        lamports: 10_000_000_000,
+        data: Buffer.alloc(0),
+        owner: SystemProgram.programId,
+        executable: false,
+      });
+      const ata = deriveAta(holder.publicKey, mintKp.publicKey);
+      await sendTx(
+        [
+          createAssociatedTokenAccountInstruction(
+            holder.publicKey,
+            ata,
+            holder.publicKey,
+            mintKp.publicKey,
+          ),
+        ],
+        [holder],
+      );
+
+      const raw = await context.banksClient.getAccount(ata);
+      const view = decodeTokenAccount(
+        Uint8Array.from(raw!.data),
+        new PublicKey(raw!.owner),
+      );
+      assert.equal(view.mint.toBase58(), mintKp.publicKey.toBase58());
+      assert.equal(view.owner.toBase58(), holder.publicKey.toBase58());
+
+      assert.throws(
+        () => decodeTokenAccount(Uint8Array.from(raw!.data), programId),
+        /not the SPL Token program/,
       );
     });
 
