@@ -941,6 +941,70 @@ Two things will otherwise waste an afternoon:
   back to `devAuthNonce()`. `npm run dev` is unchanged and still uses the
   anonymous path.
 
+#### Standing the whole thing up — done once, works
+
+`docs/surfpool.md` covers the validator; this is the rest of it, and it has been
+run end to end: the host UI offered the stake control, `POST /wager` created a
+real escrow, and `solana account` showed a `MatchAccount` owned by the program
+with a vault ATA owned by the match PDA. That path had never executed outside
+bankrun before.
+
+```bash
+# WSL: validator, then deploy at the DECLARED id
+surfpool start --offline --no-deploy --no-tui --port 8899
+solana config set --url http://127.0.0.1:8899
+solana airdrop 100
+solana program deploy --program-id target/deploy/arena-keypair.json     target/deploy/arena.so
+
+# WSL: the match authority (NOT the deployer) and a token to stake
+solana-keygen new --no-bip39-passphrase -o OpenFrontIO/.keys/arena-authority.json
+solana airdrop 50 "$(solana address -k OpenFrontIO/.keys/arena-authority.json)"
+spl-token create-token --decimals 6
+```
+
+Then `OpenFrontIO/.env` — `SOLANA_RPC_URL` and `ARENA_PUBLIC_RPC_URL` at
+`http://127.0.0.1:8899`, `ARENA_PROGRAM_ID` at the deployed id,
+`SERVER_KEYPAIR_PATH=.keys/arena-authority.json`, `ARENA_RAKE_BPS=0` — and
+`npm run dev`. Boot should say `wagering enabled and verified` **three times**
+(master plus both workers) and then `[arena/sweeper] recovering orphaned
+escrows`. Fewer than three, or no sweeper line, means the master disagrees with
+its workers — see the ordering trap below.
+
+`.keys/` and `.env*` are both gitignored. Nothing here is worth protecting, but
+keep it that way.
+
+**What still cannot be exercised headlessly:** actually staking. `join_match` is
+submitted by the *browser*, so it needs a wallet extension pointed at
+`http://127.0.0.1:8899`. Everything up to the stake prompt works without one.
+
+#### The master/worker env trap — cost an hour, will recur
+
+`Server.ts` calls `dotenv.config()` **after** its imports, and ESM evaluates the
+entire module graph before any statement in the entry file runs. So any
+module-level `process.env` read in that graph sees an **empty** environment in
+the master — while forked workers, handed an already-populated `process.env` by
+`cluster.fork()`, read the right value.
+
+`arena/rpcClient.ts` had exactly one: `new Connection(process.env.SOLANA_RPC_URL
+?? "https://api.devnet.solana.com")` at module scope. The master therefore
+pointed at **devnet** while its workers pointed at the configured RPC. The
+symptom was a boot log that read as a flake — the master reporting the program
+"not deployed on this cluster", both workers verifying the same program 1.5 s
+later. Preflight fails closed, so the master silently never started the H2
+sweeper: the one recovery mechanism meant to survive a crash, disabled by an
+import order.
+
+It only bites env-file setups; a container passing real env vars has them before
+node starts. Fixed by making the connection **lazy and memoized**
+(`getConnection()`), deliberately *not* by moving `dotenv` above the other
+imports — prettier reorders imports in this repo, so an ordering-dependent fix
+would be one `npm run format` away from coming back.
+`tests/server/ArenaRpcClient.test.ts` pins the timing, and is mutation-checked:
+restore the eager read and two of its four tests fail.
+
+**Any new module-level `process.env` read under `src/server/` inherits this
+bug.** Read env inside a function, as `ServerEnv` already does.
+
 ## Hosting this fork — three licences, and none of them are optional
 Landed in Phase H5 (`OpenFrontIO` `8a9ab4d`). Details in
 `OpenFrontIO/docs/branding.md`; the short version, because each of these is easy

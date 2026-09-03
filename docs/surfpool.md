@@ -35,8 +35,8 @@ Three terminals' worth of commands, all from WSL, all from the repo root:
 ```bash
 # 1. a local validator. --offline because we deploy our own program and fork
 #    nothing; --no-deploy because we deploy by hand rather than through a txtx
-#    runbook. NO_DNA=1 suppresses the TUI and gives plain, greppable output.
-NO_DNA=1 surfpool start --offline --no-deploy --port 8899
+#    runbook; --no-tui prints plain, greppable logs instead of the dashboard.
+surfpool start --offline --no-deploy --no-tui --port 8899
 
 # 2. build, then deploy at the DECLARED id -- `--program-id` names the keypair,
 #    and its pubkey must equal declare_id!() or every instruction fails with
@@ -69,6 +69,9 @@ so airdrop and redeploy after it.
 - **The clock only moves forward.** Each run creates a match with a nonce
   derived from `Date.now()`, so re-running against a surfnet already travelled
   into the future is fine — but a fixed nonce would collide on `init`.
+- **`NO_DNA=1` does not suppress the TUI**, despite what this file said until
+  someone tried it: the dashboard still launches and fills the log with ANSI
+  cursor moves. The flag is `--no-tui`.
 - **`npm run test:surfpool` must be run from WSL.** The root `node_modules` is
   installed there (`solana-bankrun` is a native NAPI module), so the `.bin`
   shims are Linux ones and the script fails from Windows with
