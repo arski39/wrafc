@@ -364,26 +364,110 @@ confirmation, not a change.
 auth) at project scope, for Anchor constraint and error questions. Treat its
 answers as documentation, not as authority over this file.
 
-## ⚠️ Accepted v1 limitation — client-vote winner determination
-**This is a deliberate, accepted risk, not an oversight.**
+## ✅ Phase 4 — the server decides the winner itself (was the v1 accepted risk)
 
-OpenFrontIO's simulation runs **on each client**, not on the server (see
-`OpenFrontIO/CLAUDE.md` → "Simulation Flow"). The server only relays intents. At match
-end, each client computes its own winner (`src/core/game/GameImpl.ts` `setWinner`) and
-reports it; the server accepts a winner only once a **majority of unique-IP clients
-agree** (`GameServer.handleWinner`, `VoteTally.ts`).
+**Closed.** A wagered match is now settled on a winner the server derives by
+replaying the match, not on the client-majority vote. The section this replaces
+described the vote as an accepted risk "for v1 only"; that is no longer the
+posture for wagered games.
 
-This means **the server does not independently verify who won** — it trusts client
-consensus, then signs that result for on-chain payout. In a wagered match this is a
-collusion surface: in a small or 1v1 lobby, colluding clients can satisfy the
-"majority" trivially and cause a false payout.
+### What was wrong
 
-This conflicts with the usual "never trust the client" posture and is accepted **for
-v1 only**, to get the wager loop working end-to-end. Anyone hardening this later should
-consider: requiring unanimity among wallet-verified paying players, or server-side
-validation against the per-turn state hashes already exchanged for desync detection
-(`GameServer.ts`). **Do not widen wagered matches to large public lobbies, or raise
-stake limits, without revisiting this.**
+OpenFrontIO's simulation runs **on each client** (see `OpenFrontIO/CLAUDE.md` →
+"Simulation Flow"); the server only relays intents. At match end each client
+computed its own winner and reported it, and the server accepted whatever a
+**majority of unique-IP clients** agreed on (`GameServer.handleWinner`,
+`VoteTally.ts`) — then signed that for an on-chain payout. In a small or 1v1
+lobby "a majority of clients" is trivially colluded.
+
+### Why replaying is authoritative and the vote is not
+
+The server does not need the clients' answer, because it already holds every
+input the simulation consumes:
+
+- the **turn log** — the intents it relayed, in the order it chose;
+- **GameStartInfo** — config, players and teams it assembled;
+- the map (content) and the seed, which is `simpleHash(gameID)`.
+
+`src/core` is deterministic by construction (seeded PRNG, no floating point), so
+re-running those inputs reproduces the match, and the result depends on nothing
+a client says afterwards. Colluders can still *throw* a game — that is ordinary
+bad play, not fraud — but they can no longer declare a winner that did not win.
+
+### The pieces
+
+| File | Role |
+|---|---|
+| `arena/replayVerifier.ts` | Pure. Turn log in, verdict out. No RPC, no chain. |
+| `arena/NodeMapLoader.ts` | Filesystem `GameMapLoader` — the server had never needed to load a map. |
+| `arena/replayWorker.ts` | Worker-thread entry. |
+| `arena/replayRunner.ts` | Spawns it with a deadline; never throws. |
+| `arena/verifiedSettle.ts` | What to do with the verdict. |
+
+### Three decisions worth not re-litigating
+
+**It runs on a worker thread, not inline.** The headless core does ~275
+ticks/sec, and at a 100 ms turn interval a 30-minute match is ~18,000 ticks —
+about a minute of solid CPU, with the 3-hour cap near six and a half. Inline,
+that would stall every other live game on the worker. `REPLAY_TIMEOUT_MS` is
+15 minutes: better than 2x headroom, and far inside the escrow's 24h timeout so
+a wedged replay cannot hold a pot hostage.
+
+**A hash mismatch refuses; it does not lose to the vote.** Each turn carries a
+state hash the clients agreed on live. Those hashes do *not* decide the winner —
+they are client-supplied, and a colluding majority could agree on anything. They
+are a **drift** check: if this build no longer reproduces what the players saw,
+the game just replayed is not the game that was played. So the verdict is
+`ok: false` and **settlement is skipped entirely**, leaving the pot for
+`cancel_match`'s 24h timeout to refund. Fail closed: refusing to pay is
+recoverable, paying the wrong wallet is not.
+
+**"Could not verify" never falls back to the vote.** That would reinstate
+exactly the trust being removed, and would do it precisely when something is
+already wrong. A verified replay that *disagrees* with the vote pays the
+replayed winner and logs loudly — that is what a collusion attempt looks like
+from the server's side, and it is equally what a simulation bug looks like.
+
+### ⚠️ ONE SIMULATION PER PROCESS — the sharpest edge here
+
+`loadTerrainMap` memoizes by `map:size` in a module-level `loadedMaps` and hands
+every caller the **same `GameMap` object**, into which the simulation writes
+territory ownership. A second game in the same process therefore does not start
+on an empty board — it starts on whatever the first game conquered, and state
+hashes diverge from tick 10 onward. That is a silent wrong answer, and for a
+wagered match a silent wrong answer is a payout to the wrong wallet.
+
+Found by two identical runs disagreeing in a test, not by reading the code.
+
+`replayVerifier` now **refuses** a second simulation rather than answering. It
+never fires in production — one fresh worker thread per verification means a
+fresh module registry and an empty cache — but it is what stops someone later
+moving verification inline "to avoid the thread", or batching two matches into
+one worker. `tests/server/ArenaReplayVerifier.test.ts` gets its clean process
+via `vi.resetModules()` per run for the same reason.
+
+### Tests
+
+`ArenaReplayVerifier.test.ts` runs the real core: it simulates a short game,
+treats those hashes as what the players saw, and re-derives the same game — the
+determinism claim itself, which no fixture could show. Plus divergence
+detection, the no-hashes refusal, the one-per-process guard, and one case going
+through an actual worker thread (the only test of the path production uses).
+
+`ArenaVerifiedSettle.test.ts` covers the payout decisions with the runner
+mocked, and is mutation-checked: make a failed verification fall back to the
+vote and two tests fail.
+
+### What this does and does not unlock
+
+It removes the collusion surface that kept wagered lobbies private-only, so the
+DamnBruh-style **public tier queue is now unblocked** — see the lobby direction
+section, including the rule that `ARENA_PUBLIC_WAGER_LOBBIES` must be gated on
+verification actually being available rather than being a bare boolean.
+
+It does **not** by itself make mainnet safe. Nothing here has run against a live
+cluster; Phase 3's devnet validation still comes first, and the `treasury_token`
+residual is still open.
 
 ## Deviation — Anchor upgraded 0.30.1 → 0.31.1
 The plan assumed the program stayed on `anchor-lang` 0.30.1. It could not: 0.30.1's IDL
@@ -553,7 +637,7 @@ dependency order:
 | **H4** | Auth service — JWKS, `/auth/refresh`, `/auth/wallet`, `/users/@me` | ✅ ofio `95e4b56` |
 | **H6** | The Oracle Cloud box | todo, needs a domain + region |
 | **3** | Devnet deploy + live validation (S1–S7) | needs H6; program-side blockers cleared |
-| **4** | Server-side replay winner determination | **mainnet gate** |
+| **4** | Server-side replay winner determination | ✅ ofio `1e6a64f` |
 
 **Phase H is done.** Everything left needs the domain: H6 is the box, and
 Phase 3's live validation runs on it.
