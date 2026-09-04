@@ -30,6 +30,19 @@ pub struct MatchAccount {
     pub created_at: i64,
     pub nonce: u64,
     pub bump: u8,
+    /// Where `settle_match` is allowed to send the rake.
+    ///
+    /// Appended after `bump` rather than sitting next to `mint`/`vault` where it
+    /// reads better, because Borsh packs in declaration order: putting it here
+    /// leaves every existing field offset unchanged, so the hand-rolled
+    /// TypeScript mirror in `core/arena/arenaProgram.ts` gains one offset
+    /// instead of having eleven of them shift. Fewer things to get wrong, and
+    /// the decoder's existing pins stay valid.
+    ///
+    /// `Pubkey::default()` means "no treasury", which is only allowed when
+    /// `rake_bps == 0` -- see `create_match`. At zero rake nothing is ever
+    /// transferred here, so there is nothing to misdirect.
+    pub treasury: Pubkey,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]
@@ -54,5 +67,6 @@ impl MatchAccount {
         + 8 * MAX_PLAYERS
         + 8   // created_at
         + 8   // nonce
-        + 1;  // bump
+        + 1   // bump
+        + 32; // treasury
 }

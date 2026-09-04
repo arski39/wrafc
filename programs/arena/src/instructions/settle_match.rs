@@ -61,12 +61,23 @@ pub struct SettleMatch<'info> {
     #[account(mut)]
     pub winner_token: Account<'info, TokenAccount>,
 
-    /// Rake destination. Deliberately unconstrained: there is no on-chain
-    /// record of a treasury to pin it against, and the signed digest does not
-    /// cover it either. The authority now being a required signer is what makes
-    /// that acceptable -- nobody else can choose this account. See CLAUDE.md on
-    /// the residual to revisit before rake goes live.
-    #[account(mut)]
+    /// Rake destination, pinned to the treasury recorded at `create_match`.
+    ///
+    /// It used to be unconstrained, and that was the last thing the authority
+    /// could still choose freely at settlement time. There is now an on-chain
+    /// record to pin it against, so it is pinned -- in the handler rather than
+    /// here, because the rule is conditional on `rake_bps` and an account
+    /// constraint cannot express that. See the handler; a mutation test covers
+    /// the removal.
+    ///
+    /// The mint check *is* an account constraint, because it holds
+    /// unconditionally: a treasury holding some other token fails the rake
+    /// transfer, which fails the whole settlement and strands the pot until the
+    /// 24h timeout. That was previously only caught at server boot.
+    #[account(
+        mut,
+        constraint = treasury_token.mint == match_account.mint @ ArenaError::TreasuryMintMismatch,
+    )]
     pub treasury_token: Account<'info, TokenAccount>,
 
     /// CHECK: Solana instructions sysvar
@@ -83,6 +94,7 @@ pub fn handler(ctx: Context<SettleMatch>, winner: Pubkey, scores: Vec<u64>) -> R
     let match_key = ctx.accounts.match_account.key();
     let authority_key = ctx.accounts.match_account.authority;
     let rake_bps = ctx.accounts.match_account.rake_bps;
+    let treasury = ctx.accounts.match_account.treasury;
     let nonce_bytes = ctx.accounts.match_account.nonce.to_le_bytes();
     let bump = ctx.accounts.match_account.bump;
     let player_count = ctx.accounts.match_account.player_count as usize;
@@ -102,6 +114,26 @@ pub fn handler(ctx: Context<SettleMatch>, winner: Pubkey, scores: Vec<u64>) -> R
     require!(
         ctx.accounts.winner_token.owner == winner,
         ArenaError::WinnerTokenOwnerMismatch
+    );
+
+    // The rake destination is fixed at creation and cannot be re-chosen here.
+    //
+    // Until this existed, the authority picked it at settlement: the digest
+    // does not cover `treasury_token` and nothing pinned it, so the one thing
+    // still left to the authority's discretion at payout time was where the
+    // house cut went. Deciding it once, when the match is made, is what closes
+    // that -- and it is checkable by anyone reading the match account, which a
+    // per-settlement choice never could be.
+    //
+    // Conditional on rake, so it lives here and not on the Accounts struct: at
+    // `rake_bps == 0` nothing is transferred to this account at all, and the
+    // server passes the winner's own token account rather than requiring every
+    // free-of-rake deployment to configure a treasury it will never use. Same
+    // reason H3's status gate moved off its Accounts struct. ANYTHING EDITING
+    // THIS FUNCTION MUST LEAVE THIS require! IN PLACE.
+    require!(
+        rake_bps == 0 || ctx.accounts.treasury_token.key() == treasury,
+        ArenaError::InvalidTreasury
     );
 
     // Verify Ed25519 prelude instruction (must be at index 0 in this tx)

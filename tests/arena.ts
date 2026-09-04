@@ -199,12 +199,27 @@ describe("arena", () => {
     return anchor.utils.token.associatedAddress({ mint, owner: player });
   }
 
-  async function doCreateMatch(nonce: bigint) {
+  // `treasury` is recorded on the match at creation and settle_match refuses any
+  // other rake destination, so it is an argument here rather than a per-settle
+  // choice. Overridable so the rake-free and misconfigured cases are reachable.
+  async function doCreateMatch(
+    nonce: bigint,
+    opts: { rakeBps?: number; treasury?: PublicKey } = {},
+  ) {
+    const rakeBps = opts.rakeBps ?? RAKE_BPS;
+    const treasury =
+      opts.treasury ?? (rakeBps === 0 ? PublicKey.default : treasuryAta);
     const serverAnchorKp = Keypair.fromSecretKey(Buffer.from(serverKp.secretKey));
     const [match] = matchPDA(nonce);
     const vault = vaultAta(match);
     await program.methods
-      .createMatch(new BN(ENTRY_FEE.toString()), MAX_PLAYERS, RAKE_BPS, new BN(nonce.toString()))
+      .createMatch(
+        new BN(ENTRY_FEE.toString()),
+        MAX_PLAYERS,
+        rakeBps,
+        new BN(nonce.toString()),
+        treasury,
+      )
       .accounts({
         authority: serverPubkey,
         matchAccount: match,
@@ -237,7 +252,12 @@ describe("arena", () => {
       .rpc();
   }
 
-  async function doSettleMatch(nonce: bigint, winner: PublicKey, scores: bigint[]) {
+  async function doSettleMatch(
+    nonce: bigint,
+    winner: PublicKey,
+    scores: bigint[],
+    opts: { treasuryToken?: PublicKey } = {},
+  ) {
     const [match] = matchPDA(nonce);
     const vault = vaultAta(match);
     const winnerAta = await playerAta(winner);
@@ -255,7 +275,7 @@ describe("arena", () => {
         matchAccount: match,
         vault,
         winnerToken: winnerAta,
-        treasuryToken: treasuryAta,
+        treasuryToken: opts.treasuryToken ?? treasuryAta,
         sysvarInstructions: anchor.web3.SYSVAR_INSTRUCTIONS_PUBKEY,
         tokenProgram: TOKEN_PROGRAM_ID,
       })
@@ -938,6 +958,171 @@ describe("arena", () => {
       assert.include(msg, "WinnerTokenOwnerMismatch", `unexpected error: ${msg}`);
     }
     assert.isTrue(threw, "payout destination must belong to the winner");
+  });
+
+  // --- The rake destination, fixed at creation -------------------------------
+  //
+  // The last thing the authority could still choose freely at settlement time.
+  // The digest covers the match, the winner and the scores, but not where the
+  // house cut goes, and treasury_token used to be entirely unconstrained. It is
+  // now recorded on the match when the match is made, which is a value anyone
+  // can read off chain and check, rather than a per-settlement decision nobody
+  // can audit.
+
+  it("REJECTS a settle that redirects the rake to another account", async () => {
+    // THE ONE THAT MATTERS. Remove the require! in settle_match's handler,
+    // rebuild, and this test fails -- because the settlement succeeds and the
+    // rake lands wherever the submitter asked.
+    const nonce = 40n;
+    await topUpPlayers();
+    await doFilledMatch(nonce);
+
+    // A perfectly valid token account for the right mint, just not the one the
+    // match was created with. Before the pin, this settled.
+    const elsewhere = Keypair.generate();
+    const elsewhereAta = getAssociatedTokenAddressSync(mint, elsewhere.publicKey);
+    await sendTx(
+      [
+        createAssociatedTokenAccountInstruction(
+          serverPubkey,
+          elsewhereAta,
+          elsewhere.publicKey,
+          mint,
+        ),
+      ],
+      Keypair.fromSecretKey(Buffer.from(serverKp.secretKey)),
+      [Keypair.fromSecretKey(Buffer.from(serverKp.secretKey))],
+    );
+
+    let threw = false;
+    try {
+      await doSettleMatch(nonce, player1Kp.publicKey, [200n, 100n], {
+        treasuryToken: elsewhereAta,
+      });
+    } catch (e: unknown) {
+      threw = true;
+      const msg = (e as Error).message ?? "";
+      assert.include(msg, "InvalidTreasury", `unexpected error: ${msg}`);
+    }
+    assert.isTrue(threw, "the rake destination must be the one recorded on the match");
+  });
+
+  it("rejects a treasury holding a different mint", async () => {
+    // Previously only caught at server boot, and only for our own server. A
+    // treasury on the wrong mint fails the rake transfer, which fails the whole
+    // settlement -- so the pot sits in the vault until the 24h timeout. Better
+    // to name the reason than to fail inside a CPI.
+    const nonce = 41n;
+    await topUpPlayers();
+
+    const otherMintKp = Keypair.generate();
+    const otherMint = otherMintKp.publicKey;
+    const otherAta = getAssociatedTokenAddressSync(otherMint, treasury.publicKey);
+    const rent = await context.banksClient.getRent();
+    const serverAnchorKp = Keypair.fromSecretKey(Buffer.from(serverKp.secretKey));
+    await sendTx(
+      [
+        SystemProgram.createAccount({
+          fromPubkey: serverPubkey,
+          newAccountPubkey: otherMint,
+          space: MINT_SIZE,
+          lamports: Number(rent.minimumBalance(BigInt(MINT_SIZE))),
+          programId: TOKEN_PROGRAM_ID,
+        }),
+        createInitializeMint2Instruction(otherMint, 0, serverPubkey, null),
+        createAssociatedTokenAccountInstruction(
+          serverPubkey,
+          otherAta,
+          treasury.publicKey,
+          otherMint,
+        ),
+      ],
+      serverAnchorKp,
+      [serverAnchorKp, otherMintKp],
+    );
+
+    // Created naming the wrong-mint account, so the mismatch is the match's own
+    // and not something substituted at settlement.
+    await doCreateMatch(nonce, { treasury: otherAta });
+    await doJoinMatch(nonce, player1Kp);
+    await doJoinMatch(nonce, player2Kp);
+
+    let threw = false;
+    try {
+      await doSettleMatch(nonce, player1Kp.publicKey, [200n, 100n], {
+        treasuryToken: otherAta,
+      });
+    } catch (e: unknown) {
+      threw = true;
+      const msg = (e as Error).message ?? "";
+      assert.include(msg, "TreasuryMintMismatch", `unexpected error: ${msg}`);
+    }
+    assert.isTrue(threw, "the treasury must hold the mint the match is staked in");
+  });
+
+  it("refuses to create a match that takes a rake with nowhere to send it", async () => {
+    // The complaint belongs before anyone stakes. Without this the match is
+    // created happily and then cannot settle, with the pot already escrowed and
+    // the settler correctly refusing to guess a destination.
+    const nonce = 42n;
+    let threw = false;
+    try {
+      await doCreateMatch(nonce, { rakeBps: 500, treasury: PublicKey.default });
+    } catch (e: unknown) {
+      threw = true;
+      const msg = (e as Error).message ?? "";
+      assert.include(msg, "TreasuryRequired", `unexpected error: ${msg}`);
+    }
+    assert.isTrue(threw, "a non-zero rake requires a treasury");
+  });
+
+  it("lets a rake-free match settle with any treasury account", async () => {
+    // At 0 bps nothing is transferred to treasury_token, so pinning it would
+    // only force every rake-free deployment to configure an account it never
+    // uses. settle_match still wants the account, so the settler passes the
+    // winner's own -- exactly what this asserts, since a pin would reject it.
+    const nonce = 43n;
+    await topUpPlayers();
+    await doCreateMatch(nonce, { rakeBps: 0 });
+    await doJoinMatch(nonce, player1Kp);
+    await doJoinMatch(nonce, player2Kp);
+
+    const [match] = matchPDA(nonce);
+    const stored = await program.account.matchAccount.fetch(match);
+    assert.isTrue(
+      stored.treasury.equals(PublicKey.default),
+      "a rake-free match records no treasury",
+    );
+
+    const vaultBefore = await getTokenAccount(vaultAta(match));
+    const pot = Number(vaultBefore.amount);
+    const winnerAta = await playerAta(player1Kp.publicKey);
+    const before = await getTokenAccount(winnerAta);
+
+    await doSettleMatch(nonce, player1Kp.publicKey, [200n, 100n], {
+      treasuryToken: winnerAta,
+    });
+
+    const after = await getTokenAccount(winnerAta);
+    assert.equal(
+      Number(after.amount) - Number(before.amount),
+      pot,
+      "the winner takes the whole pot when there is no rake",
+    );
+  });
+
+  it("records the treasury on the match account", async () => {
+    // The point of the whole change: the destination is readable off chain, so
+    // a settlement can be checked against it by anyone, not just by the server
+    // that submitted it.
+    const nonce = 44n;
+    await doCreateMatch(nonce);
+    const [match] = matchPDA(nonce);
+    const stored = await program.account.matchAccount.fetch(match);
+    assert.isTrue(
+      stored.treasury.equals(treasuryAta),
+      "treasury should be the account named at create_match",
+    );
   });
 
   it("cancel_match refuses a refund account that is not the staker's", async () => {

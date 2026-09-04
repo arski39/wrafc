@@ -15,14 +15,18 @@ declare_id!("4CGRLB5WJ4LK4nqwhzN5uhU78cakuHzG5wfrUZrQ2G64");
 pub mod arena {
     use super::*;
 
+    /// `treasury` is the token account the rake will be paid into, fixed here so
+    /// `settle_match` cannot be handed a different one. Pass `Pubkey::default()`
+    /// when `rake_bps` is 0; anything else is refused.
     pub fn create_match(
         ctx: Context<CreateMatch>,
         entry_fee: u64,
         max_players: u8,
         rake_bps: u16,
         nonce: u64,
+        treasury: Pubkey,
     ) -> Result<()> {
-        instructions::create_match::handler(ctx, entry_fee, max_players, rake_bps, nonce)
+        instructions::create_match::handler(ctx, entry_fee, max_players, rake_bps, nonce, treasury)
     }
 
     pub fn join_match(ctx: Context<JoinMatch>) -> Result<()> {

@@ -99,14 +99,14 @@ A `Cargo.lock` is now committed. Keep it committed.
 
 ## Status of on-chain verification — ✅ GREEN
 - `anchor build` passes. Produces `target/deploy/arena.so`, `target/idl/arena.json`
-  (all **five** instructions incl. `cancel_match` and `close_match`, **16** errors,
+  (all **five** instructions incl. `cancel_match` and `close_match`, **19** errors,
   and one `#[constant]`), `target/types/arena.ts`.
-- `anchor test --skip-deploy --skip-local-validator` — **42 passing, 0 failing.**
-  - `tests/arena.ts` (20): happy path, rake math, double-join rejected,
+- `anchor test --skip-deploy --skip-local-validator` — **50 passing, 0 failing.**
+  - `tests/arena.ts` (25): happy path, rake math, double-join rejected,
     bad-signature rejected, the six `cancel_match` tests, the four adversarial
     ed25519/authority tests (see the security section below), the refund-account
-    pairing test, and four `close_match` tests.
-  - `tests/arenaProgram.ts` (22): pins the hand-rolled program bindings
+    pairing test, four `close_match` tests, and the five treasury tests.
+  - `tests/arenaProgram.ts` (25): pins the hand-rolled program bindings
     (`OpenFrontIO/src/core/arena/arenaProgram.ts`) — see below.
 - `npm run test:surfpool` (3 more, **not** part of `anchor test`) runs against a
   really-deployed program on a local Surfpool validator, because bankrun cannot
@@ -289,13 +289,51 @@ race. Two fixes, either of which would do:
   checkable by anyone holding the authority's pubkey, the signature proves who
   submitted it.
 
-**Residual, deliberately left:** `treasury_token` is still unconstrained and is
-not in the digest, so the authority (and only the authority) chooses where the
-rake goes. There is no on-chain record of a treasury to pin it against, and
-binding it into the digest would break the digest format this file fixes as a
-Hard Rule. At `ARENA_RAKE_BPS=0` — the default — there is nothing to take.
-**Revisit before rake goes live**, most likely by storing `treasury` on
-`MatchAccount` at `create_match`.
+### ✅ The `treasury_token` residual — closed
+
+Landed as root `d96aab0`, ofio `228522e`.
+
+This section used to end with a residual: `treasury_token` was unconstrained
+and is not in the digest, so the authority (and only the authority) chose where
+the rake went, with nothing on chain to check it against. It was the last thing
+still decided at settlement time rather than fixed in advance.
+
+It is now **recorded on the `MatchAccount` at `create_match`**, and
+`settle_match` refuses any other account. That was the option this file already
+named as most likely, and it is the one that does not touch the digest — the
+digest format is a Hard Rule above, and binding a destination into it would
+break every signer.
+
+Notes worth keeping:
+
+- **`treasury` is appended after `bump`, not placed next to `mint`/`vault`.**
+  Borsh packs in declaration order, so appending left every existing field
+  offset unchanged: the TypeScript mirror gained one offset instead of eleven
+  shifting. `MATCH_ACCOUNT_SIZE` is 774 → **806**.
+- **It is an instruction argument, not an `Account<TokenAccount>`.** At
+  `rake_bps == 0` — the default, and what every deployment runs until rake is
+  turned on — there is no treasury to name, and an optional account would put
+  that into the IDL and into the hand-rolled builder for no gain. The account
+  behind it is validated where it is real: `settle_match` pins both its address
+  and (unconditionally, as an account constraint) its **mint**, which was
+  previously only checked at server boot and only for our own server.
+- **The address pin is conditional on rake, so it lives in the handler**, not on
+  the `Accounts` struct — the same reason H3's status gate moved there. Anything
+  editing that function must leave the `require!` in place; the mutation test
+  named below is the proof.
+- **`create_match` refuses `rake_bps > 0` with no treasury** (`TreasuryRequired`).
+  Taking a cut with nowhere to send it used to fail at *settlement*, with the
+  pot already in the vault and the settler correctly refusing to guess. The
+  on-chain half of a rule `preflight.ts` already enforced at boot.
+- **`settler.ts` reads the treasury from the match, not from its own env.**
+  `TREASURY_TOKEN_ACCOUNT` is now consumed at `create_match` and never again, so
+  an operator who repoints it cannot redirect the rake on a match created under
+  the old one — the same per-match recording that `programId` and `decimals`
+  already get, and for the same reason.
+
+Mutation-checked: delete the `require!` in `settle_match`, rebuild, and
+`REJECTS a settle that redirects the rake to another account` fails, because the
+settlement succeeds and the rake lands wherever the submitter asked.
 
 ### `pot = vault.amount` is correct here — do not "fix" it
 
@@ -311,7 +349,7 @@ converts a settlement-locking panic into a named error).
 ### `close_match` — new instruction
 
 Nothing ever removed a terminal match, so every match this key created held its
-rent (~0.0084 SOL: a 774-byte `MatchAccount` plus a 165-byte vault ATA) and stayed
+rent (~0.0084 SOL: an 806-byte `MatchAccount` plus a 165-byte vault ATA) and stayed
 in the sweeper's `getProgramAccounts` scan for the life of the key. `close_match`
 takes a `Settled` or `Cancelled` match with an empty vault, closes the vault via
 CPI and lets Anchor's `close = authority` handle the match account — zeroing,
@@ -335,7 +373,8 @@ in both `lib.rs` and `Anchor.toml`. Found because Surfpool needed a real deploy.
 
 6000–6010 are unmoved. Added: `WinnerTokenOwnerMismatch` 6011,
 `InvalidRefundAccount` 6012, `MathOverflow` 6013, `VaultNotEmpty` 6014,
-`MatchNotTerminal` 6015.
+`MatchNotTerminal` 6015, and for the treasury pin `InvalidTreasury` 6016,
+`TreasuryMintMismatch` 6017, `TreasuryRequired` 6018.
 
 ## The vendored `solana-dev` skill — and what is deliberately ignored
 
@@ -467,8 +506,7 @@ section — the flag is honoured only once a verification has actually succeeded
 on that process, which is a use of this phase, not merely a claim about it.
 
 It does **not** by itself make mainnet safe. Nothing here has run against a live
-cluster; Phase 3's devnet validation still comes first, and the `treasury_token`
-residual is still open.
+cluster, and Phase 3's devnet validation still comes first.
 
 ## Deviation — Anchor upgraded 0.30.1 → 0.31.1
 The plan assumed the program stayed on `anchor-lang` 0.30.1. It could not: 0.30.1's IDL
@@ -957,7 +995,7 @@ under a condition that has to be proved rather than configured:
 |---|---|---|
 | Public tier matchmaking | **Listed lobbies, gated on verification** | Was private-only while the winner came from a client-majority vote. Phase 4 removed that, and `ARENA_PUBLIC_WAGER_LOBBIES` now opens it — see below for why the flag is not a boolean. |
 | Custodial Privy wallets | Non-custodial Phantom | Hard Rule: the server never holds user funds. |
-| 10% fee on withdrawal | `rake_bps` at settlement | And the `treasury_token` residual is still open — see the security section. |
+| 10% fee on withdrawal | `rake_bps` at settlement | The destination is fixed on the match at `create_match`; see the treasury section. |
 
 **Done:** `WagerLobby.ts` is now light-DOM Tailwind on the design tokens, using
 `o-button` like everything else. It was the last shadow-DOM island in the
@@ -1170,8 +1208,9 @@ Kept for the constraints they record, not as remaining work.
      ed25519-at-index-0 requirement.
    - `TREASURY_TOKEN_ACCOUNT` is only required when `ARENA_RAKE_BPS > 0`. At 0 bps the
      program still wants the account but transfers nothing to it, so the winner's own
-     token account is passed. With rake > 0 and no treasury configured, settlement is
-     **refused** rather than sending the rake somewhere arbitrary.
+     token account is passed. It is now read at **`create_match`** and written onto
+     the match; the settler takes it from there rather than from its own env, and
+     `settle_match` refuses any other destination.
    - The old dev-mode short-circuit is gone. A registry entry always means a real
      on-chain escrow, so skipping submission in dev would not avoid touching the chain —
      it would strand real tokens.
@@ -1372,7 +1411,11 @@ cannot leak past dev: `createHtmlPlugin` is only registered when
   their own `join_match`. Falls back to `SOLANA_RPC_URL`; set it separately if that one
   embeds an API key, because this value is served to every player.
 - `ARENA_RAKE_BPS` — house cut, 0..1000. Operator-set, never host-set.
-- `TREASURY_TOKEN_ACCOUNT` — rake destination token account (needed once rake > 0)
+- `TREASURY_TOKEN_ACCOUNT` — rake destination token account (needed once rake > 0).
+  Read at **`create_match`** and written onto the match, so `settle_match` can
+  refuse any other destination. Changing it therefore only affects matches
+  created afterwards — live escrows keep paying the treasury they were made
+  with, which is the point.
 - `ARENA_AUTHORITY_KEYPAIR` — **deploy only**, path to the keypair *on the target
   host*. `update.sh` bind-mounts it read-only and sets `SERVER_KEYPAIR_PATH` to the
   in-container path itself. Setting it also forces `--restart=always`.

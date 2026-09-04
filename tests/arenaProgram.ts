@@ -219,7 +219,11 @@ describe("arenaProgram bindings", () => {
       );
       assert.deepEqual(
         ix.args.map((a) => a.name),
-        ["entry_fee", "max_players", "rake_bps", "nonce"],
+        // `treasury` is an arg and not an account: it is optional in practice
+        // (there is none at rake 0), and what matters is that it is recorded so
+        // settle_match can pin the rake destination. The account itself is
+        // validated at settlement, where it is a real account.
+        ["entry_fee", "max_players", "rake_bps", "nonce", "treasury"],
       );
     });
 
@@ -326,6 +330,11 @@ describe("arenaProgram bindings", () => {
     const ENTRY_FEE = 250_000n;
     const MAX_PLAYERS_CFG = 6;
     const RAKE_BPS = 250;
+    // Recorded on the match, not dereferenced by create_match — it is a plain
+    // Pubkey arg, and the account behind it is checked at settlement (where it
+    // is real) and at server boot. So an address that does not exist yet is a
+    // legitimate thing to record, and this describe never settles.
+    const TREASURY = Keypair.generate().publicKey;
     // Deliberately large: exercises the full u64 width of the nonce seed, which
     // is where a wrong endianness or a JS number would quietly diverge.
     const NONCE = 0xfedcba9876543210n;
@@ -382,10 +391,11 @@ describe("arenaProgram bindings", () => {
         maxPlayers: MAX_PLAYERS_CFG,
         rakeBps: RAKE_BPS,
         nonce: NONCE,
+        treasury: TREASURY,
       });
 
-      // 8-byte discriminator + u64 + u8 + u16 + u64.
-      assert.equal(ix.data.length, 27, "unexpected instruction data length");
+      // 8-byte discriminator + u64 + u8 + u16 + u64 + 32-byte pubkey.
+      assert.equal(ix.data.length, 59, "unexpected instruction data length");
       assert.deepEqual(
         Array.from(ix.data.subarray(0, 8)),
         Array.from(IX_DISCRIMINATOR.create_match),
@@ -603,7 +613,7 @@ describe("arenaProgram bindings", () => {
 
       assert.throws(
         () => decodeMatchAccount(data.subarray(0, 100), programId, programId),
-        /expected 774 bytes/,
+        new RegExp(`expected ${MATCH_ACCOUNT_SIZE} bytes`),
       );
 
       // player_count past max_players would read unpopulated slots and invent
@@ -750,6 +760,7 @@ describe("arenaProgram bindings", () => {
         maxPlayers: MAX_PLAYERS_CFG,
         rakeBps: RAKE_BPS,
         nonce: NONCE,
+        treasury: TREASURY,
       };
       assert.throws(
         () => buildCreateMatchIx({ ...base, maxPlayers: 17 }),
@@ -900,6 +911,7 @@ describe("arenaProgram bindings", () => {
         maxPlayers: seats,
         rakeBps: RAKE_BPS,
         nonce,
+        treasury: treasuryToken,
       });
       await sendTx([ix], [authority]);
 
@@ -1076,6 +1088,7 @@ describe("arenaProgram bindings", () => {
         maxPlayers: 3,
         rakeBps: RAKE_BPS,
         nonce: CANCEL_NONCE,
+        treasury: treasuryToken,
       });
       await sendTx([ix], [authority]);
 

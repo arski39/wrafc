@@ -37,4 +37,10 @@ pub enum ArenaError {
     VaultNotEmpty,
     #[msg("Match is not in a terminal state")]
     MatchNotTerminal,
+    #[msg("Treasury token account does not match the one recorded on the match")]
+    InvalidTreasury,
+    #[msg("Treasury token account holds a different mint than the match")]
+    TreasuryMintMismatch,
+    #[msg("A treasury must be given when rake_bps is greater than zero")]
+    TreasuryRequired,
 }
