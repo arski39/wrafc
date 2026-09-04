@@ -101,8 +101,8 @@ Anchor 0.30.1 + Solana 1.18.26 + Rust 1.79 **cannot build this project**:
   really-deployed program on a local Surfpool validator — the only way to reach
   the 24-hour deadline, and the only proof the program is *deployable* rather
   than merely loadable. See `docs/surfpool.md`.
-- **3736 game-side tests** (`npm test` from `OpenFrontIO/`, which runs the suite
-  then re-runs `tests/server`, so those are counted twice — 3125 + 611).
+- **3740 game-side tests** (`npm test` from `OpenFrontIO/`, which runs the suite
+  then re-runs `tests/server`, so those are counted twice — 3127 + 613).
 - The wager loop is closed end to end: create escrow → stake → play → pay out,
   with the winner derived by server-side replay rather than a client vote.
 - **Nothing has run against a live cluster.** Surfpool and bankrun are both
@@ -493,6 +493,7 @@ The live plan to a public devnet site is
 | — | Public wagered lobbies, gated on verification | ✅ ofio `92d88f3` |
 | — | Treasury pinned on the match | ✅ root `75ed1ad`, ofio `228522e` |
 | — | Image map layout + ARM64 build | ✅ ofio `551e612` |
+| **2** | Branding — name single-sourced to `SITE_NAME` | ✅ ofio `440a4c0` (name is a placeholder) |
 | **H6** | The Oracle Cloud box | in progress — box exists, needs a domain |
 | **3** | Devnet deploy + live validation (S1–S7) | needs H6 |
 | **H7** | Ops runbook | after Phase 3 |
@@ -875,8 +876,19 @@ these is easy to silently undo:
   upstream, which is only honest for an unmodified build.
 - **§7 cuts both ways:** preserve copyright notices (`CREDITS.md`, the upstream
   links, `proprietary/LICENSE` stay), but do not present this as official
-  OpenFront — the name, logo and page title must change. The title is still
-  `OpenFront (ALPHA)`, a Crowdin-managed string in `en.json`, waiting on the name.
+  OpenFront — the name, logo and page title must change.
+- **The site name is `SITE_NAME`, and the page title is NOT a translated string.**
+  It used to be `<title data-i18n="main.title">`, and ~40 Crowdin-managed locale
+  files each hardcode upstream's name — only `en.json` is editable here, so a
+  rename through the translation system would have left the fork calling itself
+  OpenFront in every language but English. That is the §7 misrepresentation, not
+  a cosmetic slip. The title now renders from `siteName`, the variable `og:title`
+  already used, so no new EJS variable was introduced. `main.title` is gone from
+  `en.json` (the repo refuses unused keys); **do not re-add it or re-wire the
+  title through it.** *Mutation-checked:* restore the `data-i18n` title and two
+  `AppShellBranding.test.ts` cases fail.
+- **`Warchest Arena` is a placeholder**, pending the domain. Logo and favicon are
+  still the neutral mark — that art should follow the final name.
 
 **`index.html` has two renderers, which is how this bit us.** `RenderHtml.ts`
 renders it in production; **`vite.config.ts` renders it for `npm run dev`** from
@@ -1029,7 +1041,9 @@ match's URL routes to a worker that has never heard of it.
   listing.
 
 ### Site
-- `SITE_NAME` — public display name, used for `og:title`. Falls back to `DOMAIN`.
+- `SITE_NAME` — public display name. Drives **both** the browser tab title and
+  `og:title`; falls back to `DOMAIN`. It is the only place the name lives, so a
+  rename is this one variable plus the logo art.
 - `SOURCE_REPO_URL` — where **this** deployment's source lives. Drives the footer
   link. **Unset is an AGPL §13 problem, not a cosmetic one** (see the licensing
   section). The master logs a warning at boot outside dev.
