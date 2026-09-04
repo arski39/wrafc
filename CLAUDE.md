@@ -291,7 +291,7 @@ race. Two fixes, either of which would do:
 
 ### ✅ The `treasury_token` residual — closed
 
-Landed as root `d96aab0`, ofio `228522e`.
+Landed as root `75ed1ad`, ofio `228522e`.
 
 This section used to end with a residual: `treasury_token` was unconstrained
 and is not in the digest, so the authority (and only the authority) chose where
