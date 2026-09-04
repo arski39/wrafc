@@ -1,6 +1,6 @@
 # Surfpool — testing what bankrun cannot
 
-The 42 tests in `tests/arena.ts` and `tests/arenaProgram.ts` run under
+The 50 tests in `tests/arena.ts` and `tests/arenaProgram.ts` run under
 [bankrun](https://kevinheavey.github.io/solana-bankrun/): an in-process SVM that
 loads `target/deploy/arena.so` directly. That is why they are fast and hermetic,
 and it is also their limit — **bankrun is not a deploy**. It never exercises
@@ -13,6 +13,12 @@ is the only practical way to reach it against a real validator. On a plain
 `solana-test-validator` you would have to wait a day.
 
 This is **Phase 3 preparation**. Nothing in the normal workflow depends on it.
+
+It is worth running after any change to the account layout or to an instruction's
+arguments, though. bankrun loads `arena.so` in-process, so it proves the program
+logic without ever proving the program can be *deployed* — a distinction that
+only shows up here. The treasury change (`MatchAccount` 774 -> 806 bytes, a new
+`create_match` argument) was checked this way.
 
 ## Install (once, in WSL)
 
