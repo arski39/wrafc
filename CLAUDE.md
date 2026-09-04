@@ -101,8 +101,8 @@ Anchor 0.30.1 + Solana 1.18.26 + Rust 1.79 **cannot build this project**:
   really-deployed program on a local Surfpool validator — the only way to reach
   the 24-hour deadline, and the only proof the program is *deployable* rather
   than merely loadable. See `docs/surfpool.md`.
-- **3722 game-side tests** (`npm test` from `OpenFrontIO/`, which runs the suite
-  then re-runs `tests/server`, so those are counted twice — 3118 + 604).
+- **3736 game-side tests** (`npm test` from `OpenFrontIO/`, which runs the suite
+  then re-runs `tests/server`, so those are counted twice — 3125 + 611).
 - The wager loop is closed end to end: create escrow → stake → play → pay out,
   with the winner derived by server-side replay rather than a client vote.
 - **Nothing has run against a live cluster.** Surfpool and bankrun are both
@@ -325,7 +325,7 @@ a winner that did not win.
 | File | Role |
 |---|---|
 | `arena/replayVerifier.ts` | Pure. Turn log in, verdict out. No RPC, no chain. |
-| `arena/NodeMapLoader.ts` | Filesystem `GameMapLoader`. |
+| `arena/NodeMapLoader.ts` | Filesystem `GameMapLoader`. Two layouts — see below. |
 | `arena/replayWorker.ts` | Worker-thread entry. |
 | `arena/replayProbeWorker.ts` | Second worker, for the boot probe's recording pass. |
 | `arena/replayRunner.ts` | Spawns them with a deadline; never throws. |
@@ -355,6 +355,42 @@ replay that *disagrees* with the vote pays the replayed winner and logs loudly �
 that is what a collusion attempt looks like from the server's side, and equally
 what a simulation bug looks like. *Mutation-checked:* make a failed verification
 fall back and two tests in `ArenaVerifiedSettle.test.ts` fail.
+
+### ⚠️ The image has no `resources/maps` — the loader must not assume it does
+
+`Dockerfile` deletes `resources/maps` after the build, because `build-prod`
+already emitted a content-hashed copy of every one of those files under
+`static/_assets/maps`. Both trees are **499 MB**; shipping both is ~1 GB of
+duplicated map data for nothing.
+
+Upstream's comment there said the maps were "not used by the server", which
+stopped being true when Phase 4 landed. `NodeMapLoader` therefore resolves
+through **`static/asset-manifest.json`** — the semantic *name → hashed url*
+mapping the build emits — whenever the plain directory is absent, and throws
+naming **both** locations when neither is.
+
+- **`asset-manifest.json`, not `asset-hashes.json`.** The latter is keyed by the
+  already-hashed emitted path and carries integrity data, so it cannot answer
+  "where did `map.bin` go".
+- **Manifest hrefs go through `normalizeAssetPath`**, which decodes per segment
+  and rejects `.`/`..`, so a manifest cannot name a path outside `static/`.
+- **Do not delete `static/_assets/maps`**, and do not restore `resources/maps`
+  to the image expecting the loader to need it.
+- **`ReplayInput.staticDir` exists only so tests can deny both layouts.**
+  Production leaves it undefined and the loader resolves `static/`
+  module-relative — the worker thread inherits nothing about where it started.
+
+This was invisible to tsc and to every unit test, because a checkout has the
+directory. In the image it made **every wagered match fail verification and
+refund on the escrow's 24 h timeout**, and kept `ARENA_PUBLIC_WAGER_LOBBIES`
+permanently unhonourable. *Mutation-checked twice:* force the directory resolver
+and both `ArenaNodeMapLoader.test.ts` and `ArenaReplayProbe.test.ts`'s
+`verifies a match with only the image's hashed map assets` fail.
+
+**`npm ci --ignore-scripts` in the build stage is load-bearing too**, matching
+`npm run inst`: `canvas` is a devDependency with an install script and
+node-canvas publishes no linux-arm64 prebuild, so plain `npm ci` drops into
+node-gyp and dies on the ARM box. Nothing under `src/` imports it.
 
 ### ⚠️ ONE SIMULATION PER PROCESS — the sharpest edge here
 
@@ -456,6 +492,7 @@ The live plan to a public devnet site is
 | **4** | Server-side replay winner determination | ✅ ofio `1e6a64f` |
 | — | Public wagered lobbies, gated on verification | ✅ ofio `92d88f3` |
 | — | Treasury pinned on the match | ✅ root `75ed1ad`, ofio `228522e` |
+| — | Image map layout + ARM64 build | ✅ ofio `551e612` |
 | **H6** | The Oracle Cloud box | in progress — box exists, needs a domain |
 | **3** | Devnet deploy + live validation (S1–S7) | needs H6 |
 | **H7** | Ops runbook | after Phase 3 |
@@ -463,10 +500,9 @@ The live plan to a public devnet site is
 **Not built:** quick-join matchmaking per tier — the part of DamnBruh's model
 that pairs strangers automatically rather than listing what hosts have made.
 
-**Two known bugs blocking deployment**, both confirmed and both in the plan file:
-the Dockerfile's `rm -rf ./resources/maps` breaks Phase 4 replay verification in
-the image, and `canvas` (a devDependency with no linux-arm64 prebuild) breaks the
-ARM64 build because the build stage runs plain `npm ci`.
+**The road to a public devnet site** is `~/.claude/plans/jazzy-moseying-ullman.md`,
+which carries the step-by-step. Blocked on inputs only you have: the site name,
+the domain, and the go-ahead to push to GitHub.
 
 ---
 
