@@ -5,6 +5,13 @@ skip-lint = false
 [programs.localnet]
 arena = "4CGRLB5WJ4LK4nqwhzN5uhU78cakuHzG5wfrUZrQ2G64"
 
+# Same id on every cluster, and that is the point: target/deploy/arena-keypair.json
+# is the program's identity, so devnet gets the id that `declare_id!` in lib.rs
+# already hardcodes. A mismatch is invisible to bankrun and fails every
+# instruction on a real cluster with DeclaredProgramIdMismatch.
+[programs.devnet]
+arena = "4CGRLB5WJ4LK4nqwhzN5uhU78cakuHzG5wfrUZrQ2G64"
+
 [registry]
 url = "https://api.apr.dev"
 
