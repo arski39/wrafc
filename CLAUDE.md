@@ -494,16 +494,21 @@ The live plan to a public devnet site is
 | — | Treasury pinned on the match | ✅ root `75ed1ad`, ofio `228522e` |
 | — | Image map layout + ARM64 build | ✅ ofio `551e612` |
 | **2** | Branding — name single-sourced to `SITE_NAME` | ✅ ofio `440a4c0` (name is a placeholder) |
-| **H6** | The Oracle Cloud box | in progress — box exists, needs a domain |
-| **3** | Devnet deploy + live validation (S1–S7) | needs H6 |
+| **H6** | The Oracle Cloud box | ✅ both firewalls, Docker 29.8 arm64 |
+| — | Domain, Cloudflare DNS, TLS decision | ✅ `warchest-arena.com` live, Origin cert |
+| — | GitHub repos | ✅ created, Actions off — **not yet pushed** |
+| — | Deploy path (`deploy/`) | ✅ ofio `d9299a7` |
+| — | `scripts/devnet/` for S1–S7 | ✅ root `1ae97bd` |
+| **3** | Devnet deploy + live validation (S1–S7) | needs devnet SOL |
 | **H7** | Ops runbook | after Phase 3 |
 
 **Not built:** quick-join matchmaking per tier — the part of DamnBruh's model
 that pairs strangers automatically rather than listing what hosts have made.
 
 **The road to a public devnet site** is `~/.claude/plans/jazzy-moseying-ullman.md`,
-which carries the step-by-step. Blocked on inputs only you have: the site name,
-the domain, and the go-ahead to push to GitHub.
+which carries the step-by-step. Remaining inputs only you have: devnet SOL from
+faucet.solana.com, a Cloudflare Turnstile site key, and running the two
+`git push`es (the sandbox refuses them).
 
 ---
 
@@ -855,6 +860,67 @@ mutation-checked.
 **Any new module-level `process.env` read under `src/server/` inherits this bug.**
 Read env inside a function, as `ServerEnv` already does.
 
+**`GAME_ENV` is the same trap, one level worse, and it is not fixable in code.**
+`ServerEnv.ts`'s `gameEnv` is a **static field initializer**, so it runs at
+module evaluation — earlier than any function call, and long before
+`dotenv.config()`. So `GAME_ENV` **cannot come from a `.env` file the app parses
+itself**; it must reach the process as a real environment variable
+(`docker run --env-file` does, dotenv does not). Missing, the process dies at
+import with a bare `unsupported game env: undefined` and **no
+`Failed to start server:` line**, because `main().catch()` never runs. Invisible
+under vitest, where `vite.config.ts` textually substitutes `"dev"` in.
+
+---
+
+## Deploying — `deploy/`, and the health check that lies
+
+`deploy/warchest.sh`, `deploy/Caddyfile`, `deploy/warchest.env.example`.
+**All four of upstream's scripts are unusable and are not patched** — the
+reasons are in `warchest.sh`'s header and `deploy/README.md`.
+
+### ⚠️ `/api/health` returning 200 does not mean the site is up
+
+It goes green as soon as the workers register, and **stays green while every
+`GET /` returns 500** — `RenderHtml.ts` reads `TURNSTILE_SITE_KEY`,
+`GIT_COMMIT`, `DOMAIN` and `NUM_WORKERS` while building its EJS data object,
+long after the health route is serving. A monitor watching only `/api/health`
+reports a healthy site nobody can load.
+
+**Any smoke test must fetch `/` and assert markup.** `warchest.sh` does both.
+Connection-refused in the first seconds is *not* a failure: the master binds
+`:3000` only after `runWagerPreflight()`, which makes live RPC round-trips.
+
+### The boot-log counts are the real arena check
+
+`wagering enabled and verified` must appear **`NUM_WORKERS + 1`** times, and
+`[arena/sweeper] recovering orphaned escrows` **exactly once**. Workers verified
+with no sweeper line is the master/worker env trap above, and its consequence is
+exact: the only crash-recovery path for live escrows is silently disabled.
+`warchest.sh` asserts both and refuses the deploy otherwise.
+
+### Fixed by topology, not by patching
+
+`trust proxy` is **correct as shipped** for this deployment: the apex is
+Cloudflare-proxied, so the game is Cloudflare → Caddy → nginx → Express = 3 hops
+(`Master.ts`, `Worker.ts` set 3), and `api.` is DNS-only, so auth is
+Caddy → Express = 1 hop (`routes.ts` sets 1). **Grey-clouding the apex would
+require dropping the game's value to 2** — otherwise `req.ip` takes a
+client-supplied `X-Forwarded-For` entry and the per-IP rate limiter becomes
+trivially bypassable.
+
+### Other rules that are load-bearing
+
+- **Build natively on the target box, never `--platform`.** esbuild picks its
+  platform binary from the *build host's* arch.
+- **`--restart=always` unconditionally.** `update.sh` sets `no` unless
+  `SUBDOMAIN=main`; a wagering server that stays down leaves live escrows with
+  nothing to settle or refund them.
+- **Secrets are read-only bind mounts at `/run/secrets/`**, never env vars, and
+  the keypair must be readable by **uid 1000** — a `600` root-owned file mounts
+  fine and is then unreadable by the container's `node` user.
+- **Never `docker image prune -a -f`.** It runs box-wide and deletes the build
+  cache and the rollback target.
+
 ---
 
 ## Hosting this fork — three licences, none optional
@@ -955,6 +1021,12 @@ list exists so nobody re-opens the question from scratch.
     deployed — the only way to reach `MATCH_TIMEOUT_SECS`, and the only check that
     the program *deploys*. Worth running after any account-layout or instruction-arg
     change. See `docs/surfpool.md`.
+  - `npm run test:devnet` (`scripts/devnet/`) asserts S1–S7 against a really-
+    deployed program on **devnet**, which is the only place RPC latency, real
+    confirmation ordering and blockhash expiry exist. It cannot reach the 24 h
+    `InProgress` timeout — that needs Surfpool's `surfnet_timeTravel` cheatcode —
+    so the two suites are complements, not alternatives. See
+    `scripts/devnet/README.md`.
   - **Root `npm` scripts must run from WSL.** `node_modules` is installed there
     (`solana-bankrun` is a native NAPI module), so the `.bin` shims are Linux ones
     and Windows fails with `'ts-mocha' is not recognized`.
@@ -977,8 +1049,21 @@ list exists so nobody re-opens the question from scratch.
 `OpenFrontIO/.env` (add to `example.env` as they land).
 
 **Required for a non-dev boot, or the process dies:** `GAME_ENV` (throws at
-module import), `NUM_WORKERS`, `GIT_COMMIT` (a Docker build arg),
-`TURNSTILE_SITE_KEY` (every `GET /` 500s without it), `DOMAIN`.
+module import — and **cannot come from a `.env` file**, see the env trap),
+`NUM_WORKERS`, `GIT_COMMIT` (a Docker build arg), `TURNSTILE_SITE_KEY`, `DOMAIN`.
+
+**`GIT_COMMIT`, `TURNSTILE_SITE_KEY`, `DOMAIN` and `NUM_WORKERS` do not stop the
+boot — they 500 every `GET /` while `/api/health` stays 200.** `RenderHtml.ts`
+reads all four while building its EJS data object. That is why a smoke test must
+fetch `/`.
+
+`GAME_ENV`, `NUM_WORKERS` and `TURNSTILE_SITE_KEY` were undocumented until
+ofio `d9299a7`; they are now in `example.env` with the traps written down.
+
+**Turnstile is currently decorative.** Only `TURNSTILE_SITE_KEY` exists — there
+is no secret key, because upstream's closed API did the verification. The widget
+renders and nothing checks the token. Set a real key, but do not count it as a
+bot defence.
 
 **`NUM_WORKERS` is a pick-once decision.** Game ids shard to workers via
 `simpleHash(gameID) % NUM_WORKERS`, so changing it re-shards every id and a live
