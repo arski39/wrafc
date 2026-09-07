@@ -933,9 +933,13 @@ these is easy to silently undo:
   plumbing remain so a licensed copy can be restored — but do not restore the
   assets, and **reject any upstream merge that re-adds them**. Nothing breaks
   without them; the font and music failures are already caught.
-- **Do not reinstate upstream's analytics.** In a fork, their Google Ads and GA4
-  tags report your traffic into their accounts. `AppShellBranding.test.ts` asserts
-  their absence precisely because `index.html` is a merge target.
+- **Do not reinstate upstream's analytics.** In a fork, their Google Ads, GA4
+  and **Cloudflare Web Analytics** tags report your traffic into their accounts.
+  `AppShellBranding.test.ts` asserts their absence precisely because
+  `index.html` is a merge target. The Cloudflare beacon
+  (`cloudflareinsights.com`, token `03d93e6f…`) survived the first sweep because
+  it sits further down the file under its own heading — it is now covered too,
+  and mutation-checked.
 - **AGPL v3 §13 is the load-bearing one.** Offering a modified version over a
   network obliges you to offer its users *that version's* source. The mechanism is
   the footer link, driven by `SOURCE_REPO_URL`. Unset means the footer points at
@@ -1060,10 +1064,29 @@ fetch `/`.
 `GAME_ENV`, `NUM_WORKERS` and `TURNSTILE_SITE_KEY` were undocumented until
 ofio `d9299a7`; they are now in `example.env` with the traps written down.
 
-**Turnstile is currently decorative.** Only `TURNSTILE_SITE_KEY` exists — there
-is no secret key, because upstream's closed API did the verification. The widget
-renders and nothing checks the token. Set a real key, but do not count it as a
-bot defence.
+**Turnstile has two halves and needs both.** `TURNSTILE_SITE_KEY` (game server,
+public, rendered into every page) and **`TURNSTILE_SECRET_KEY` (auth service,
+secret)**. The widget always rendered, and `JoinVerify.ts` always POSTed to
+`api.$DOMAIN/join_verify` — but that endpoint lived in upstream's **closed** API,
+so it 404'd and every join fell open. `src/auth/turnstile.ts` is the missing
+half.
+
+**With no secret the route is not registered at all**, so it 404s and the old
+fail-open behaviour is unchanged. That is deliberate: a route that exists and
+approves everything looks like bot protection while being none. The auth service
+says which it is at boot.
+
+**`/join_verify` does not moderate names.** Upstream's worker ran an LLM check
+and could return a rewritten username; this fork passes names through unchanged.
+The game server already screens locally via `Censor.ts` — its documented
+fail-open path — so nothing regresses, but an `approved` here does not mean a
+name was vetted.
+
+**A null token skips siteverify, and that is the contract, not a hole.** A
+Turnstile token is single-use, so an already-admitted player reconnecting has
+none left. `planJoinVerify()` on the game server is what guarantees a *first*
+join never arrives with a null token; forwarding one would be a full bypass.
+*Mutation-checked* along with the hostname pin and the reject path.
 
 **`NUM_WORKERS` is a pick-once decision.** Game ids shard to workers via
 `simpleHash(gameID) % NUM_WORKERS`, so changing it re-shards every id and a live
@@ -1121,6 +1144,10 @@ match's URL routes to a worker that has never heard of it.
 - `AUTH_ALLOW_PUBLIC_LOBBIES` — whether `/users/@me` reports
   `canCreatePublicLobbies`. Listing a *wagered* lobby additionally needs
   `ARENA_PUBLIC_WAGER_LOBBIES` and a verification that passed.
+- `TURNSTILE_SECRET_KEY` — the **secret** half of the Turnstile widget, read
+  only by the auth service. Empty leaves `POST /join_verify` **unregistered**,
+  so it 404s and the game server falls open exactly as before. Setting it is
+  what makes the widget mean anything.
 - `AUTH_ALLOWED_ORIGINS` — extra origins allowed to send credentialed auth
   requests. `https://$DOMAIN`, its subdomains and dev localhost are allowed without
   listing.
