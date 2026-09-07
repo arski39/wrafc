@@ -4,7 +4,9 @@
   "private": true,
   "scripts": {
     "test": "ts-mocha -p ./tsconfig.json -t 1000000 tests/*.ts",
-    "test:surfpool": "ts-mocha -p ./tsconfig.json -t 180000 tests/surfpool/*.ts"
+    "test:surfpool": "ts-mocha -p ./tsconfig.json -t 180000 tests/surfpool/*.ts",
+    "devnet:setup": "ts-node --project ./tsconfig.json scripts/devnet/setup.ts",
+    "test:devnet": "ts-mocha -p ./tsconfig.json -t 600000 scripts/devnet/scenarios.ts"
   },
   "devDependencies": {
     "@coral-xyz/anchor": "^0.31.1",
