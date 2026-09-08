@@ -712,9 +712,28 @@ These were established while building the integration and are still live:
   that *some* confirmed transaction touched the match PDA — which any transaction
   naming the account satisfies, including one that failed to stake or one somebody
   else sent. `ClientJoinMessage.onchainTxSig` is still sent but is **audit-only**.
-- **It retries the read 3× at 400 ms.** The joining browser may be on a different
-  RPC (`ARENA_PUBLIC_RPC_URL`) than the server, and a node briefly behind would
+- **It retries 5× with exponential backoff and jitter** (~300/600/1200/2400 ms,
+  ±20%). The joining browser may be on a different RPC
+  (`ARENA_PUBLIC_RPC_URL`) than the server, and a node briefly behind would
   otherwise kick a player who genuinely paid.
+- **A transport failure is transient; only `MatchAccountDecodeError` is
+  permanent.** These were once one catch, so a single 429 returned "not a
+  member" *without the retry loop running at all* — kicking a paying player.
+  Found on the first real devnet run, where `api.devnet.solana.com`
+  rate-limited repeatedly. Mutation-checked in
+  `ArenaMembershipRetry.test.ts`; collapsing the catches fails two tests.
+- **`MembershipCheck.failure` separates "could not check" from "did not pay".**
+  Exhaustion still refuses — admitting an unverified wallet into a wagered match
+  is never acceptable — but `rpc-unavailable` makes a run of these read as an
+  outage rather than fraud, and `Worker.ts` tells the player to retry instead of
+  telling them their fee was not confirmed.
+- **The jitter is load-bearing.** Every player in a filling lobby joins within
+  seconds of the others, so a fixed schedule makes them retry in lockstep
+  against an already rate-limited endpoint.
+- **Public RPC endpoints rate-limit this hard.** `api.devnet.solana.com` 429s
+  under the load of a single test run. Use a dedicated endpoint for
+  `SOLANA_RPC_URL` before going public, and keep `ARENA_PUBLIC_RPC_URL`
+  keyless — it is served to every browser.
 - **`decodeMatchAccount` validates owner, discriminator, length, `MatchStatus`
   range and `player_count <= max_players` before trusting a field.** The owner
   check is load-bearing: without it any account of the right length decodes into a
