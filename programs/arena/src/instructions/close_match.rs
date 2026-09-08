@@ -8,7 +8,7 @@ use crate::errors::ArenaError;
 /// `settle_match` and `cancel_match` write a terminal status and nothing else:
 /// with no close instruction, every match this authority ever created stayed on
 /// chain for the life of the key. Two costs followed. The authority's rent --
-/// a 774-byte `MatchAccount` plus a 165-byte vault ATA, about 0.0084 SOL a
+/// an 806-byte `MatchAccount` plus a 165-byte vault ATA, about 0.0085 SOL a
 /// match -- was never returned, and the recovery sweeper's `getProgramAccounts`
 /// scan had to keep filtering an ever-growing terminal set server-side.
 ///

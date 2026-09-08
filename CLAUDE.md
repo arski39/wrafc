@@ -291,7 +291,7 @@ settlement-locking panic into a named error.
 
 ### `close_match` — rent reclamation
 
-Without it every match this key created held its rent (~0.0084 SOL: an 806-byte
+Without it every match this key created held its rent (~0.0085 SOL: an 806-byte
 `MatchAccount` plus a 165-byte vault ATA) and stayed in the sweeper's
 `getProgramAccounts` scan for the life of the key. It takes a `Settled` or
 `Cancelled` match with an empty vault, closes the vault via CPI and lets Anchor's
@@ -496,11 +496,14 @@ The live plan to a public devnet site is
 | **2** | Branding — name single-sourced to `SITE_NAME` | ✅ ofio `440a4c0` (name is a placeholder) |
 | **H6** | The Oracle Cloud box | ✅ both firewalls, Docker 29.8 arm64 |
 | — | Domain, Cloudflare DNS, TLS decision | ✅ `warchest-arena.com` live, Origin cert |
-| — | GitHub repos | ✅ created, Actions off — **not yet pushed** |
+| — | GitHub repos | ✅ pushed, public, Actions off |
 | — | Deploy path (`deploy/`) | ✅ ofio `d9299a7` |
 | — | `scripts/devnet/` for S1–S7 | ✅ root `1ae97bd` |
-| **3** | Devnet deploy + live validation (S1–S7) | needs devnet SOL |
-| **H7** | Ops runbook | after Phase 3 |
+| **3** | Devnet deploy + live validation (S1–S7) | ✅ deployed; S1–S7 **8/8** on devnet |
+| — | Turnstile verified server-side (`/join_verify`) | ✅ ofio `c85cc0c` |
+| — | Live site at `warchest-arena.com` | ✅ ofio `a9f7c3a` |
+| — | Browser half — two wallets staking a real lobby | **next; needs two funded wallets** |
+| **H7** | Ops runbook | after the browser half |
 
 **Not built:** quick-join matchmaking per tier — the part of DamnBruh's model
 that pairs strangers automatically rather than listing what hosts have made.
@@ -917,6 +920,49 @@ with no sweeper line is the master/worker env trap above, and its consequence is
 exact: the only crash-recovery path for live escrows is silently disabled.
 `warchest.sh` asserts both and refuses the deploy otherwise.
 
+### ⚠️ `curl … | grep -q` cannot work in this script — and fails in the worst direction
+
+`warchest.sh` runs under `set -euo pipefail`. `grep -q` exits the instant it
+matches, the writer upstream of it then dies of **SIGPIPE**, and `pipefail`
+reports the whole pipeline as failed. Two checks were built on that shape:
+
+- the **health gate** (`curl / | grep -qi '<html'`) could therefore never pass.
+  It rolled back two deploys that had actually succeeded.
+- the **dev-bypass check** (`docker logs | grep -q 'arena/devBypass'`) fails only
+  when grep *matches* — so it passed silently in precisely the case it exists to
+  catch.
+
+Both are fixed by not piping: `serves_markup()` captures the body and
+pattern-matches it in the shell, and the log check uses `grep -c … || true` and
+compares a count.
+
+**It does not reproduce on a small page**, which is the trap. A response that
+fits the 64 KB pipe buffer never triggers SIGPIPE, so a local repro passes.
+Measured against the live server the real command was **rc=23 on 5/5 runs** at
+151,609 bytes. Any new pipeline added to that script needs the same treatment.
+
+### ⚠️ Two certificates, and the Origin one must not carry the wildcard
+
+`api.` is **DNS-only**, so browsers *and* the game container's own JWKS fetch
+reach it directly — and a Cloudflare **Origin** certificate is trusted by
+Cloudflare and by nothing else. Serving it there is `SEC_E_UNTRUSTED_ROOT` and
+auth stops working entirely: no browser login, no server-side JWKS. The apex
+gets away with it only because Cloudflare proxies the apex and presents its own
+Universal SSL to the browser, so the Origin cert is seen by Cloudflare alone.
+
+So `api.` gets a real Let's Encrypt certificate that Caddy obtains and renews
+itself. That is also why `auto_https` is **`disable_redirects` and not `off`** —
+`off` would disable that issuance along with the redirects.
+
+**Dropping `import origin_tls` from the `api.` block is not sufficient.** Caddy
+matches certificates out of one **process-wide cache, by SAN**, so an Origin cert
+whose SANs include `*.warchest-arena.com` matches `api.` no matter which site
+block loaded it. Caddy logs *"skipping automatic certificate management because
+one or more matching certificates are already loaded"* and serves the untrusted
+cert regardless. There is no per-site scoping and no `force_automate` in Caddy
+2.11. **Issue the Cloudflare Origin certificate for the apex and `www` only** —
+never the wildcard.
+
 ### Fixed by topology, not by patching
 
 `trust proxy` is **correct as shipped** for this deployment: the apex is
@@ -937,6 +983,13 @@ trivially bypassable.
 - **Secrets are read-only bind mounts at `/run/secrets/`**, never env vars, and
   the keypair must be readable by **uid 1000** — a `600` root-owned file mounts
   fine and is then unreadable by the container's `node` user.
+- **uid 1000 is not necessarily the login user, and here it is not.** On this
+  Oracle Ubuntu image `ubuntu` is **1001**; uid 1000 is `opc`. So
+  `chown ubuntu:ubuntu` yields a key the container cannot read while looking
+  entirely correct in `ls -l`. Generate as root and `chown 1000:1000` **by
+  number**. `warchest.sh`'s `check_secret()` prints the numeric owner for
+  exactly this reason — three separate docs claimed uid 1000 was `ubuntu` and
+  all three were wrong.
 - **Never `docker image prune -a -f`.** It runs box-wide and deletes the build
   cache and the rollback target.
 
@@ -1181,5 +1234,5 @@ match's URL routes to a worker that has never heard of it.
 - Existing OpenFront vars (`GAME_ENV`, `API_KEY`, `DOMAIN`, …) — see `example.env`.
 
 **Ops requirement:** the server keypair needs a funded SOL balance to pay rent for
-each match's `MatchAccount` and vault ATA (~0.0084 SOL, reclaimable via
+each match's `MatchAccount` and vault ATA (~0.0085 SOL, reclaimable via
 `close_match`). Use a devnet faucet for testing.
