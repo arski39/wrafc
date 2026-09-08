@@ -505,8 +505,15 @@ The live plan to a public devnet site is
 | — | Browser half — two wallets staking a real lobby | **next; needs two funded wallets** |
 | **H7** | Ops runbook | after the browser half |
 
-**Not built:** quick-join matchmaking per tier — the part of DamnBruh's model
-that pairs strangers automatically rather than listing what hosts have made.
+| **G1** | 1v1 primary, public lobbies secondary | ✅ ofio `4460f9d` |
+| **G3** | Wallet login — the browser half of `/auth/wallet` | ✅ ofio `82e8629` |
+
+**Not built:** quick-join matchmaking per tier (**G2**) — the part of DamnBruh's
+model that pairs strangers automatically rather than listing what hosts have
+made. The blocker is written down: `wagerRefusedForVisibility(isPublic)` refuses
+a master-created matchmaking lobby unconditionally, because nobody in it staked
+and there is no host to create the escrow. A duel queue must therefore pair into
+a **private** lobby whose escrow the server creates at pairing time.
 
 **The road to a public devnet site** is `~/.claude/plans/jazzy-moseying-ullman.md`,
 which carries the step-by-step. Remaining inputs only you have: devnet SOL from
@@ -809,6 +816,20 @@ its own process and container at `api.$DOMAIN`. **Full detail in
   auth service has no business setting, and `server/Logger.ts` wires OpenTelemetry
   at import time — either would make it unable to boot alone. It shares only
   `src/core/`.
+- **Wallet login is the sign-in, and it is menu-only.** `client/arena/walletLogin.ts`
+  is the browser half of `/auth/wallet`; it replaced the inherited Discord,
+  Google and email buttons, which all navigate to endpoints this service 404s.
+  Signing in swaps `sub`, hence the persistentID, hence any `walletRegistry`
+  binding and any in-flight `jti`-bound match signature — so it **refuses**
+  while `document.body` has `in-game` or the `.arena-wager-overlay` stake prompt
+  is open, rather than trying to reconcile. At the menu nothing is bound yet.
+  Staking still needs no login; the arena verifies wallet ownership per match.
+- **The login message is built in the browser, never fetched.**
+  `/auth/wallet/challenge` returns the nonce *without* the signable text on
+  purpose, so a spoofed service cannot get a wallet to sign arbitrary bytes.
+  Both ends are pinned: `AuthService.test.ts` that a match signature is refused
+  as a login, `ArenaWalletLogin.test.ts` that the client never produces one.
+  Both mutation-checked. **Do not unify the two prefixes.**
 - **`AuthService.test.ts` runs under `// @vitest-environment node`.** The repo
   default is jsdom, whose `TextEncoder` is a different realm — jose and tweetnacl
   both type-check with `instanceof`, so every sign() fails there.
