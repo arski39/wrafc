@@ -29,11 +29,11 @@ rate-limited, so use **faucet.solana.com**.
 
 ## What each file is
 
-| | |
-|---|---|
-| `common.ts` | Connection, payer, `send`, `tokenBalance`, `readMatch`, nonce |
-| `setup.ts` | Creates the mint (6 decimals, no freeze authority) and the treasury ATA |
-| `scenarios.ts` | S1–S7 as a mocha suite |
+|                |                                                                         |
+| -------------- | ----------------------------------------------------------------------- |
+| `common.ts`    | Connection, payer, `send`, `tokenBalance`, `readMatch`, nonce           |
+| `setup.ts`     | Creates the mint (6 decimals, no freeze authority) and the treasury ATA |
+| `scenarios.ts` | S1–S7 as a mocha suite                                                  |
 
 Everything reads through the **production** bindings in
 `OpenFrontIO/src/core/arena/arenaProgram.ts` — the same module the server and
@@ -61,16 +61,16 @@ account and `init` fails with an error that looks nothing like the cause.
 
 ## What is covered
 
-| | |
-|---|---|
-| S1 | Created match is `Open`; fee, rake, mint, authority and **treasury** as configured |
-| S2 | Two stakes → `InProgress`, vault holds the pot, `players[]` in join order |
-| S3+S4 | Winner paid `pot − rake`, rake exactly `pot × bps / 10000`, vault empties, `close_match` returns both rents |
-| S5 | `Open` cancel refunds exactly the stake |
-| S5b | A refund account not owned by `players[i]` is refused |
-| S6 | A digest the program will not recompute is rejected, pot untouched |
-| S6b | A settle redirecting the rake to another account is refused |
-| S7 | A winner who staked from a **non-ATA** token account is paid after `ensureTokenAccount` creates their canonical ATA |
+|       |                                                                                                                     |
+| ----- | ------------------------------------------------------------------------------------------------------------------- |
+| S1    | Created match is `Open`; fee, rake, mint, authority and **treasury** as configured                                  |
+| S2    | Two stakes → `InProgress`, vault holds the pot, `players[]` in join order                                           |
+| S3+S4 | Winner paid `pot − rake`, rake exactly `pot × bps / 10000`, vault empties, `close_match` returns both rents         |
+| S5    | `Open` cancel refunds exactly the stake                                                                             |
+| S5b   | A refund account not owned by `players[i]` is refused                                                               |
+| S6    | A digest the program will not recompute is rejected, pot untouched                                                  |
+| S6b   | A settle redirecting the rake to another account is refused                                                         |
+| S7    | A winner who staked from a **non-ATA** token account is paid after `ensureTokenAccount` creates their canonical ATA |
 
 S7 is the real shape of that case: `join_match` checks only `owner` and `mint`,
 not canonical ATA derivation, so a player can legitimately stake from a plain
@@ -91,3 +91,32 @@ is the program's half, against a real cluster.
 using the server's. The production authority is generated **on the deployment
 box** and must never exist anywhere else. The program cannot tell the difference
 — `authority` is simply whoever signed `create_match`.
+
+## `inspectMatch.ts` — reading a live escrow (ops, not a test)
+
+```bash
+npm run devnet:inspect -- EE96ZrfK     # one lobby's escrow
+npm run devnet:inspect -- --all        # every escrow this program holds
+```
+
+Read-only: it submits nothing and signs nothing, so it is safe to point at the
+live deployment mid-match. Written for the only question that matters when a
+game goes wrong — _where are the stakes_ — and it answers it from the chain
+alone, which is the same reason the sweeper works: chain state survives
+everything the server does not.
+
+**It cannot derive a PDA from a game id.** `deriveMatchPda` needs the match
+authority, and that keypair exists only on the box. So the lookup runs the other
+way — enumerate the program's accounts, match on `nonce`, which _is_ derivable
+from the game id. That is also why `--all` is the useful mode when you do not
+know which lobby you are looking for.
+
+It prints the vault's token balance next to the status deliberately. The status
+is what the program believes; the balance is where the money actually is, and a
+`Settled` match with a non-empty vault is a different problem from a `Settled`
+match with an empty one.
+
+**A game id that finds nothing is ambiguous, and the output says so:** either no
+escrow was ever created for that lobby, or it reached a terminal state and
+`close_match` has already reclaimed its rent. Only the players' token balances
+separate those two.
