@@ -471,6 +471,27 @@ player back into the matchmaking queue, wrong for a hand-built private lobby.
 `settler.ts` detects `Open` and refunds via `cancel_match`. Do not "fix" this by
 relaxing the program's status check — the refund is the correct outcome.
 
+### ⚠️ Once the escrow is `InProgress`, the server can no longer refund it
+
+`cancel_match` refuses an `InProgress` match until `MATCH_TIMEOUT_SECS` (24 h),
+deliberately — otherwise the authority could cancel a match people are playing.
+The consequence is easy to miss and it has already bitten once: **a wagered
+match that fills and then fails to start on every client is unreachable for a
+full day**, and no server-side cleverness can release it early. By the time the
+failure is detectable, it is already too late.
+
+That happened live (`EE96ZrfK`): both wallets staked, the escrow filled
+correctly, then the game failed to boot on both clients, so settlement rightly
+refused an unverifiable replay and the pot waited out the timeout. Every step
+correct, terrible outcome.
+
+**So the fix is prevention, not recovery** — do not let a wagered match start
+until every staked client has proven it can run the game, which keeps the escrow
+`Open`, where `cancel_match` is accepted at any age and the one refund site
+already applies. Tracked as `[J]` in the plan.
+**Do not shorten `MATCH_TIMEOUT_SECS` instead:** its length is what stops a
+refund racing a slow-but-live settlement.
+
 ---
 
 ## Roadmap
@@ -508,6 +529,7 @@ The live plan to a public devnet site is
 | **H1** | Storefront removed; Clans hidden | ✅ ofio (this change) |
 | **H3** | Earnings leaderboard (on-chain per-wallet stats) | after the browser half |
 | **H7** | Ops runbook | after the browser half |
+| **J** | A filled wager must not strand on a start failure | planned, highest value |
 
 **The duel map pool is shared, not copied.** `core/arena/duelSettings.ts` holds
 upstream's ranked 1v1 pool — Australia 40%, Iceland / Asia / EuropeClassic 20%
