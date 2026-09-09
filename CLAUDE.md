@@ -707,6 +707,15 @@ that recruits strangers into lobbies that can only ever refund.
 - **Joins from the browser route through the same stake gate as a pasted lobby id** —
   `JoinLobbyModal` dispatches `join-lobby` with `source: "private"` for both, which
   is what `Main.resolveWagerJoin` keys on. Worth not breaking.
+- **The stake prompt states the refund/forfeit boundary, above the stake button.**
+  Leaving before the last seat stakes is free (escrow `Open`, `end()`'s not-started
+  branch refunds); leaving after it forfeits (`cancel_match` refuses `InProgress`
+  for 24 h). Same action, opposite outcome, and the switch is the *other* player
+  staking — which that screen cannot show. **Do not add a time estimate to it:**
+  the same prompt serves a listed duel (cancelled ~5 min after listing) and a
+  hand-made private wagered lobby with no armed timer (up to `MAX_GAME_DURATION_MS`),
+  so any number is a promise broken for one of them. Mutation-checked on position —
+  a disclaimer under the button is one nobody reads before deciding.
 
 *Mutation-checked twice:* drop the probe requirement and `REFUSES when the server
 cannot actually verify` fails; drop the gate from `listingRefusedForWager` and
