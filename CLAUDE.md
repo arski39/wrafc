@@ -556,6 +556,19 @@ a master-created matchmaking lobby unconditionally, because nobody in it staked
 and there is no host to create the escrow. A duel queue must therefore pair into
 a **private** lobby whose escrow the server creates at pairing time.
 
+**Not built, but wanted (`[I]` in the plan): Mobile Wallet Adapter.** Mobile
+staking today goes through `phantomBrowseLink()`, which reopens the site inside
+Phantom's in-app browser — a separate browser context, hence the stake prompt's
+refusal to follow it mid-lobby. MWA would let an ordinary mobile tab hand a
+signing request to any installed wallet with no navigation, but it is
+**Android-Chrome-only and never iOS**, so it is additive and the deeplink stays.
+The prerequisite is the surprise: `registerMwa` registers MWA as a **Wallet
+Standard** wallet, and `WalletProvider.ts` does no Wallet Standard discovery at
+all — its header comment claiming otherwise was simply wrong. The open question
+is whether MWA exposes sign-only `solana:signTransaction` or only
+`solana:signAndSendTransaction`; `onchainJoin.ts` submits the transaction itself
+on purpose, to surface the program's error.
+
 **The road to a public devnet site** is `~/.claude/plans/jazzy-moseying-ullman.md`,
 which carries the step-by-step. Remaining inputs only you have: devnet SOL from
 faucet.solana.com, a Cloudflare Turnstile site key, and running the two
