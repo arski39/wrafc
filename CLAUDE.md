@@ -507,16 +507,22 @@ The live plan to a public devnet site is
 | **G3** | Wallet login — the browser half of `/auth/wallet` | ✅ ofio `82e8629` |
 | **H7** | Ops runbook | after the browser half |
 
-**Deferred, deliberately — the duel map pool.** `MapPlaylist.get1v1Config()`
-already holds upstream's ranked 1v1 pool: Australia 40%, Iceland / Asia /
-EuropeClassic 20% each, `maxPlayers: 2`, nations disabled, FFA, 15 min (10 when
-compact), 400 bots (100 compact), 30 s spawn immunity. It is a considered pool
-and is probably what duels should use. Today a duel takes `getRandomMapType()`
-over every map instead. Adopting it means a duel lobby taking a server-chosen
-config rather than the host modal's, which is a real change to where a private
-lobby's config comes from — **not decided yet, on purpose.**
+**The duel map pool is shared, not copied.** `core/arena/duelSettings.ts` holds
+upstream's ranked 1v1 pool — Australia 40%, Iceland / Asia / EuropeClassic 20%
+each — plus the bot count and match clock that go with it. Both
+`MapPlaylist.get1v1Config()` (the ranked path) and `HostLobbyModal`'s duel
+preset read it, because two copies of a five-map list is the same drift setup as
+the wallet prefix that was once declared twice. `ArenaDuelSettings.test.ts`
+asserts the ranked path still draws from it, and is mutation-checked.
 
-**Also not built:** a site-wide online player count. The lobby broadcast carries
+A duel host configures **nothing**: `HostLobbyModal.renderBody()` returns a
+waiting room instead of the settings screen when `duelPreset` is set. The early
+return is deliberate — a settings section added later is then absent from duels
+by default, which is the safe direction. Both players stake the same amount, so
+the map is part of what they paid for; letting whoever clicked first choose it
+is an edge bought with nothing.
+
+**Not built:** a site-wide online player count. The lobby broadcast carries
 `numClients` per *listed* lobby only, and a started game leaves that list — so
 summing it reads near-zero exactly when the most people are playing. An honest
 number needs the workers to report their total connected clients through the
