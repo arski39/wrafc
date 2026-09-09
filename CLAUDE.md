@@ -505,6 +505,8 @@ The live plan to a public devnet site is
 | — | Browser half — two wallets staking a real lobby | **next; needs two funded wallets** |
 | **G1** | 1v1 primary, public lobbies secondary | ✅ ofio `4460f9d` |
 | **G3** | Wallet login — the browser half of `/auth/wallet` | ✅ ofio `82e8629` |
+| **H1** | Storefront removed; Clans hidden | ✅ ofio (this change) |
+| **H3** | Earnings leaderboard (on-chain per-wallet stats) | after the browser half |
 | **H7** | Ops runbook | after the browser half |
 
 **The duel map pool is shared, not copied.** `core/arena/duelSettings.ts` holds
@@ -521,6 +523,23 @@ return is deliberate — a settings section added later is then absent from duel
 by default, which is the safe direction. Both players stake the same amount, so
 the map is part of what they paid for; letting whoever clicked first choose it
 is an edge bought with nothing.
+
+**Three inherited surfaces were removed or hidden, and one lesson generalises.**
+The cosmetics **storefront** is deleted — this deployment sells nothing
+(`/cosmetics.json` is empty, every purchase endpoint 404s) and `Store.ts` linked
+to *upstream's* merch shop from a fork. **Clans** is hidden like Ranked, and its
+cause is worth remembering because it was not the missing API:
+`/reserved_clan_tags` works fine, but `ClanModal` reads `/users/@me`'s
+deliberate `user: {}` as "not signed in" and self-closes even for a wallet
+session. **Replacing half of an API produces shape mismatches, not just 404s**,
+and those do not fail open. The clan *tag* is separate and works.
+
+**Removing a modal breaks links you cannot see.** Five `#modal=store` deep links
+lived outside the storefront, and `ModalRouter` strips an unregistered modal
+name **silently** — so each became a dead button that tsc, lint and 3189 tests
+all pass. Two were reachable; the worse one discarded the host's lobby to reach
+a page that no longer exists. **Grep `#modal=` before deleting a registered
+modal.**
 
 **Not built:** a site-wide online player count. The lobby broadcast carries
 `numClients` per *listed* lobby only, and a started game leaves that list — so
