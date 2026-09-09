@@ -503,10 +503,9 @@ The live plan to a public devnet site is
 | — | Turnstile verified server-side (`/join_verify`) | ✅ ofio `c85cc0c` |
 | — | Live site at `warchest-arena.com` | ✅ ofio `a9f7c3a` |
 | — | Browser half — two wallets staking a real lobby | **next; needs two funded wallets** |
-| **H7** | Ops runbook | after the browser half |
-
 | **G1** | 1v1 primary, public lobbies secondary | ✅ ofio `4460f9d` |
 | **G3** | Wallet login — the browser half of `/auth/wallet` | ✅ ofio `82e8629` |
+| **H7** | Ops runbook | after the browser half |
 
 **Not built:** quick-join matchmaking per tier (**G2**) — the part of DamnBruh's
 model that pairs strangers automatically rather than listing what hosts have
