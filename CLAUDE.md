@@ -507,6 +507,23 @@ The live plan to a public devnet site is
 | **G3** | Wallet login — the browser half of `/auth/wallet` | ✅ ofio `82e8629` |
 | **H7** | Ops runbook | after the browser half |
 
+**Deferred, deliberately — the duel map pool.** `MapPlaylist.get1v1Config()`
+already holds upstream's ranked 1v1 pool: Australia 40%, Iceland / Asia /
+EuropeClassic 20% each, `maxPlayers: 2`, nations disabled, FFA, 15 min (10 when
+compact), 400 bots (100 compact), 30 s spawn immunity. It is a considered pool
+and is probably what duels should use. Today a duel takes `getRandomMapType()`
+over every map instead. Adopting it means a duel lobby taking a server-chosen
+config rather than the host modal's, which is a real change to where a private
+lobby's config comes from — **not decided yet, on purpose.**
+
+**Also not built:** a site-wide online player count. The lobby broadcast carries
+`numClients` per *listed* lobby only, and a started game leaves that list — so
+summing it reads near-zero exactly when the most people are playing. An honest
+number needs the workers to report their total connected clients through the
+`lobbyList` IPC message and the master to sum it into `lobbiesBroadcast`. The
+duel picker's per-tier "N waiting" is derived from the broadcast and is
+therefore correct as-is; it counts players *waiting*, not playing.
+
 **Not built:** quick-join matchmaking per tier (**G2**) — the part of DamnBruh's
 model that pairs strangers automatically rather than listing what hosts have
 made. The blocker is written down: `wagerRefusedForVisibility(isPublic)` refuses
