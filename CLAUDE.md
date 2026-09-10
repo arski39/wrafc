@@ -101,12 +101,15 @@ Anchor 0.30.1 + Solana 1.18.26 + Rust 1.79 **cannot build this project**:
   really-deployed program on a local Surfpool validator — the only way to reach
   the 24-hour deadline, and the only proof the program is *deployable* rather
   than merely loadable. See `docs/surfpool.md`.
-- **3740 game-side tests** (`npm test` from `OpenFrontIO/`, which runs the suite
-  then re-runs `tests/server`, so those are counted twice — 3127 + 613).
+- **3850 game-side tests** (`npm test` from `OpenFrontIO/`, which runs the suite
+  then re-runs `tests/server`, so those are counted twice — 3212 + 638).
 - The wager loop is closed end to end: create escrow → stake → play → pay out,
   with the winner derived by server-side replay rather than a client vote.
-- **Nothing has run against a live cluster.** Surfpool and bankrun are both
-  local. Devnet validation is Phase 3.
+- **This now runs against a live cluster.** The program is deployed on devnet,
+  S1–S7 pass against it, the site is live at `warchest-arena.com`, and two real
+  browser wallets have staked a real escrow to `InProgress`. What has **never**
+  been observed end to end is play → replay-verify → settle: no wagered match has
+  ever paid out on a live cluster.
 
 ### `tests/arenaProgram.ts` — why there is no Anchor client
 Arena instructions are built **byte by byte** rather than through
@@ -485,12 +488,34 @@ correctly, then the game failed to boot on both clients, so settlement rightly
 refused an unverifiable replay and the pot waited out the timeout. Every step
 correct, terrible outcome.
 
-**So the fix is prevention, not recovery** — do not let a wagered match start
-until every staked client has proven it can run the game, which keeps the escrow
-`Open`, where `cancel_match` is accepted at any age and the one refund site
-already applies. Tracked as `[J]` in the plan.
-**Do not shorten `MATCH_TIMEOUT_SECS` instead:** its length is what stops a
-refund racing a slow-but-live settlement.
+**⚠️ Correcting an earlier version of this note:** it said the fix was to withhold
+`start()` until every staked client proved it could run the game, "which keeps the
+escrow `Open`". **That does not work, and the reason is in the program.**
+`join_match.rs:58-59` flips the status the moment the last seat is paid:
+
+```rust
+if m.player_count == m.max_players {
+    m.status = MatchStatus::InProgress;
+```
+
+So the escrow is `InProgress` from the instant the second player stakes — seconds
+*before* the lobby starts. Any gate placed between fill and `start()` is already
+too late; there is no window in which the match is both full and cancellable.
+
+That leaves two honest directions, and they are different sizes:
+
+1. **Gate the stake, not the start.** Make a client prove it can run the game
+   *before* it is allowed to stake the last seat. A client that cannot never
+   pays, the escrow never fills, it stays `Open`, and the existing single refund
+   site applies with no program change. This is the cheap one and should be
+   costed first.
+2. **A program change** letting the authority cancel an `InProgress` match that
+   demonstrably never started. This widens what the authority can do to a live
+   match and needs the same scrutiny as the four security invariants — the naive
+   version lets the authority cancel a match people are playing.
+
+**Do not shorten `MATCH_TIMEOUT_SECS` in either case:** its length is what stops a
+refund racing a slow-but-live settlement. Tracked as `[J]` in the plan.
 
 ---
 
@@ -523,10 +548,11 @@ The live plan to a public devnet site is
 | **3** | Devnet deploy + live validation (S1–S7) | ✅ deployed; S1–S7 **8/8** on devnet |
 | — | Turnstile verified server-side (`/join_verify`) | ✅ ofio `c85cc0c` |
 | — | Live site at `warchest-arena.com` | ✅ ofio `a9f7c3a` |
-| — | Browser half — two wallets staking a real lobby | **next; needs two funded wallets** |
+| — | Browser half — two wallets staking a real lobby | ✅ staked; escrow filled to `InProgress` |
+| — | Browser half — a wagered match actually settling | **never observed; blocked on `[J]`** |
 | **G1** | 1v1 primary, public lobbies secondary | ✅ ofio `4460f9d` |
 | **G3** | Wallet login — the browser half of `/auth/wallet` | ✅ ofio `82e8629` |
-| **H1** | Storefront removed; Clans hidden | ✅ ofio (this change) |
+| **H1** | Storefront removed; Clans hidden | ✅ ofio `3d21dadd` |
 | **H3** | Earnings leaderboard (on-chain per-wallet stats) | after the browser half |
 | **H7** | Ops runbook | after the browser half |
 | **J** | A filled wager must not strand on a start failure | planned, highest value |
@@ -538,6 +564,33 @@ each — plus the bot count and match clock that go with it. Both
 preset read it, because two copies of a five-map list is the same drift setup as
 the wallet prefix that was once declared twice. `ArenaDuelSettings.test.ts`
 asserts the ranked path still draws from it, and is mutation-checked.
+
+### 🔴 A filled duel auto-starts on the WRONG GameConfig — live regression
+
+**`e954a322` orphaned `putGameConfig()` for wagered duels.** Suspected cause of
+the `EE96ZrfK` failure; the *mechanism* is verified, its role in that incident is
+not yet proven.
+
+The duel preset deliberately does **not** push its config when it is set
+(`HostLobbyModal.ts:1100-1106`), because `putGameConfig()` reaches the server over
+the `eventBus`, which does not exist until the host's connection is up. Its
+comment says the push is safe to defer because *"`toggleGameStartTimer()` awaits
+`putGameConfig()` before starting"*.
+
+`maybeAutoStartFilledWager()` (`GameServer.ts:1990`) then made a filled wagered
+lobby start **itself**, server-side, via `setStartsAt()`. It never asks the client
+for anything — so `toggleGameStartTimer()` never runs, and for an auto-started
+duel **`putGameConfig()` never runs at all**. The match starts on whatever
+`GameConfig` the server already held: not the duel map, not the duel bot count,
+not the match clock, not `maxPlayers: 2`.
+
+A duel host has no settings controls to fire any of the other ~40
+`putGameConfig()` call sites, so there is no accidental second path that saves it.
+
+**The general rule:** the duel preset's correctness depends on a client-side
+call that a server-side auto-start bypasses. Anything that makes the server start
+a lobby on its own must first ensure the config it will start on is the one the
+lobby was advertised with.
 
 A duel host configures **nothing**: `HostLobbyModal.renderBody()` returns a
 waiting room instead of the settings screen when `duelPreset` is set. The early
