@@ -581,6 +581,41 @@ for a lobby that never started routes to `refundWageredLobby()`, the one refund
 site. No second cancellation path. `tests/server/EmptyLobbyReap.test.ts`,
 mutation-checked.
 
+### A filled wager could start before the last staker actually arrived — fixed
+
+`maybeAutoStartFilledWager()` armed its countdown on the escrow reporting
+`InProgress` — correct as a payment check, but the escrow reaches `InProgress`
+the instant the last `join_match` **confirms on chain**, which is seconds
+before that player's own browser has even opened its websocket. It still has
+to connect, send `join`, and survive `verifyOnchainMembership`'s retry ladder
+(~300/600/1200/2400 ms of backoff by itself). `WAGER_FULL_START_DELAY_MS` (5 s)
+was not always enough.
+
+Losing that race started the match without them: a 1v0 the connected player won
+by walkover, paying out a pot the absent player staked and never got to play
+for. Their own client — still showing "connecting" — then told them **they had
+not entered the game in time**, and left the lobby on their behalf. Observed
+live, escrow `92M66WDU`, 2026-09-11: both wallets had genuinely staked and the
+escrow had filled correctly. Every step up to this one was doing exactly what
+it was supposed to.
+
+**Fixed by requiring presence, not just payment.** The gate now also counts
+connected, non-spectator clients against the escrow's seat count before arming.
+Not starting is the safe direction — a wagered lobby that never starts refunds
+through the existing single refund site; one that starts wrong pays the wrong
+wallet, and there is no undo for that on chain.
+
+**A second, independent guard on the client**: `JoinLobbyModal` never times a
+player out of a lobby `Main` has recorded as staked (`markStakedJoin()`, set
+only when the stake gate actually took payment). The join-timeout's usual
+response — leave the lobby — is right for a free public lobby you merely
+clicked, and the worst possible response for a wagered one: the stake is
+already escrowed, so leaving recovers nothing and only guarantees the match
+cannot be played. Staying costs nothing, and the server can still admit a late
+arrival.
+
+*Mutation-checked* in `tests/server/ArenaWagerStartPresence.test.ts`.
+
 ## Roadmap
 
 Full plan: `~/.claude/plans/where-are-we-on-staged-snowflake.md` (note: parts of
