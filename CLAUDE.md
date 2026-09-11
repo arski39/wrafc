@@ -983,9 +983,17 @@ These were established while building the integration and are still live:
   seconds of the others, so a fixed schedule makes them retry in lockstep
   against an already rate-limited endpoint.
 - **Public RPC endpoints rate-limit this hard.** `api.devnet.solana.com` 429s
-  under the load of a single test run. Use a dedicated endpoint for
-  `SOLANA_RPC_URL` before going public, and keep `ARENA_PUBLIC_RPC_URL`
-  keyless — it is served to every browser.
+  under the load of a single test run. **Done (2026-09-11):** `SOLANA_RPC_URL`
+  is a dedicated `devnet.helius-rpc.com` endpoint and `ARENA_PUBLIC_RPC_URL` is
+  pinned separately to `api.devnet.solana.com`, keyless, because that one is
+  served to every browser. Verified by effect as well as by config — the
+  sweeper's four `getProgramAccounts` per 15 min log **zero** `sweep failed`.
+  ⚠️ **Keep both lines set.** `publicRpcUrl()` resolves
+  `ARENA_PUBLIC_RPC_URL ?? SOLANA_RPC_URL ?? api.devnet.solana.com`, so deleting
+  the public one does not fall back to a safe default — it publishes the **keyed**
+  endpoint into every page load and every `WagerInfo`. The one externally
+  checkable half is `arenaRpcUrl` in the live page's `BOOTSTRAP_CONFIG`; if it
+  ever carries a credential, that is this fallback firing.
 - **`decodeMatchAccount` validates owner, discriminator, length, `MatchStatus`
   range and `player_count <= max_players` before trusting a field.** The owner
   check is load-bearing: without it any account of the right length decodes into a
@@ -1236,7 +1244,11 @@ block loaded it. Caddy logs *"skipping automatic certificate management because
 one or more matching certificates are already loaded"* and serves the untrusted
 cert regardless. There is no per-site scoping and no `force_automate` in Caddy
 2.11. **Issue the Cloudflare Origin certificate for the apex and `www` only** —
-never the wildcard.
+never the wildcard. **The old wildcard cert has been deleted from Cloudflare
+(2026-09-11)**, so the trap is no longer armed — but the rule is why, and
+re-issuing a wildcard Origin cert would rearm it silently: `api.` would go back
+to serving an untrusted certificate, and auth would stop working for every
+browser *and* for the game container's own JWKS fetch.
 
 ### Fixed by topology, not by patching
 
@@ -1440,15 +1452,21 @@ join never arrives with a null token; forwarding one would be a full bypass.
 match's URL routes to a worker that has never heard of it.
 
 ### Arena
-- `SOLANA_RPC_URL` — RPC endpoint.
+- `SOLANA_RPC_URL` — RPC endpoint. A **dedicated** one in this deployment
+  (`devnet.helius-rpc.com`), because the sweeper's `getProgramAccounts` is the
+  call public endpoints throttle hardest and its failure is a log line nobody
+  reads. It embeds an API key, which is why the next one is set too.
 - `SERVER_KEYPAIR_PATH` — server ed25519 keypair; **must be the same keypair** used
   as match `authority` in `create_match` and as signer in `settle_match`. Loaded in
   exactly one place, `arena/serverKeypair.ts`.
 - `ARENA_PROGRAM_ID` — deployed program id. **Leaving it empty disables wagering
   entirely**: the host UI hides the stake control and every lobby stays free.
 - `ARENA_PUBLIC_RPC_URL` — RPC endpoint handed to **joining browsers**, which submit
-  their own `join_match`. Falls back to `SOLANA_RPC_URL`; set it separately if that
-  one embeds an API key, because this value is served to every player.
+  their own `join_match`. **Must stay set and must stay keyless.** The fallback is
+  `ARENA_PUBLIC_RPC_URL ?? SOLANA_RPC_URL ?? api.devnet.solana.com`
+  (`arena/matchRegistry.ts`), so unsetting it does *not* land on the public
+  default — it publishes the keyed endpoint above into every page load and every
+  `WagerInfo`. Currently `api.devnet.solana.com`.
 - `ARENA_STAKE_MINT` — the SPL token every stake is denominated in. **Required once
   `ARENA_PROGRAM_ID` is set.** Verified at boot: must exist, be owned by the
   **legacy** Token program, be initialized, and declare at most 9 decimals.
