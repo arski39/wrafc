@@ -617,6 +617,7 @@ The live plan to a public devnet site is
 | **H1** | Storefront removed; Clans hidden | ✅ ofio `3d21dadd` |
 | **H3** | Earnings leaderboard (on-chain per-wallet stats) | after the browser half |
 | **H7** | Ops runbook | after the browser half |
+| **K** | A filled duel starts on the config it was advertised with | ✅ ofio `ff627818` |
 | **J** | A filled wager must not strand on a start failure | planned, highest value |
 
 **The duel map pool is shared, not copied.** `core/arena/duelSettings.ts` holds
@@ -627,32 +628,37 @@ preset read it, because two copies of a five-map list is the same drift setup as
 the wallet prefix that was once declared twice. `ArenaDuelSettings.test.ts`
 asserts the ranked path still draws from it, and is mutation-checked.
 
-### 🔴 A filled duel auto-starts on the WRONG GameConfig — live regression
+### A filled duel must start on the config it was advertised with — fixed
 
-**`e954a322` orphaned `putGameConfig()` for wagered duels.** Suspected cause of
-the `EE96ZrfK` failure; the *mechanism* is verified, its role in that incident is
-not yet proven.
+`e954a322` orphaned `putGameConfig()` for wagered duels, and it was live.
 
 The duel preset deliberately does **not** push its config when it is set
-(`HostLobbyModal.ts:1100-1106`), because `putGameConfig()` reaches the server over
-the `eventBus`, which does not exist until the host's connection is up. Its
-comment says the push is safe to defer because *"`toggleGameStartTimer()` awaits
-`putGameConfig()` before starting"*.
+(`HostLobbyModal.ts`): `putGameConfig()` reaches the server over the `eventBus`,
+which does not exist until the host's connection is up. Its comment justified
+the deferral as *"`toggleGameStartTimer()` awaits `putGameConfig()` before
+starting"* — which stopped being true the moment `maybeAutoStartFilledWager()`
+made a filled wagered lobby start **itself**, server-side, via `setStartsAt()`.
+That asks the client for nothing, so `toggleGameStartTimer()` never ran and for
+an auto-started duel **`putGameConfig()` never ran at all**. The match started
+on whatever `GameConfig` the server already held: not the duel map, not the bot
+count, not the match clock, not `maxPlayers: 2`. A duel host has no settings
+controls, so none of the other ~40 call sites could accidentally save it.
 
-`maybeAutoStartFilledWager()` (`GameServer.ts:1990`) then made a filled wagered
-lobby start **itself**, server-side, via `setStartsAt()`. It never asks the client
-for anything — so `toggleGameStartTimer()` never runs, and for an auto-started
-duel **`putGameConfig()` never runs at all**. The match starts on whatever
-`GameConfig` the server already held: not the duel map, not the duel bot count,
-not the match clock, not `maxPlayers: 2`.
+**The fix is where it can be earliest, not where it is convenient.**
+`handleLobbyInfo` pushes the preset on the **first `lobby_info`** — the first
+proof the connection exists, and therefore the first moment the config *can* be
+sent. Once, flagged, because `lobby_info` arrives continuously and
+`putGameConfig()` regenerates the lobby URL each time. Scoped to `duelPreset`
+deliberately: every other host lobby has a settings screen whose first
+interaction pushes, and pushing local defaults unasked would clobber the real
+config of a lobby reopened through `attachToExistingLobby()`.
+*Mutation-checked* in `tests/client/ArenaDuelConfigPush.test.ts`.
 
-A duel host has no settings controls to fire any of the other ~40
-`putGameConfig()` call sites, so there is no accidental second path that saves it.
-
-**The general rule:** the duel preset's correctness depends on a client-side
-call that a server-side auto-start bypasses. Anything that makes the server start
-a lobby on its own must first ensure the config it will start on is the one the
-lobby was advertised with.
+**The rule this leaves behind:** the duel preset's correctness depended on a
+client-side call, and a server-side auto-start bypassed it. **Anything that
+makes the server start a lobby on its own must first ensure the config it will
+start on is the one the lobby was advertised with.** Do not go back to relying
+on `toggleGameStartTimer()` to carry a config.
 
 A duel host configures **nothing**: `HostLobbyModal.renderBody()` returns a
 waiting room instead of the settings screen when `duelPreset` is set. The early
@@ -660,6 +666,31 @@ return is deliberate — a settings section added later is then absent from duel
 by default, which is the safe direction. Both players stake the same amount, so
 the map is part of what they paid for; letting whoever clicked first choose it
 is an edge bought with nothing.
+
+### Both players of a duel see the same waiting room
+
+`arena/duelWaitingRoom.ts` renders the pot and the two seats; each side supplies
+its own footer. It is shared because the two players **arrive through different
+modals** — the host through `HostLobbyModal`, which created the lobby and
+attached the escrow, and the opponent through `JoinLobbyModal`, where every
+other private join already lands.
+
+The opponent used to arrive nowhere at all. `DuelPanel` closed itself and
+dispatched `join-lobby`, and nothing opened: `Main.handleJoinLobby` only opens
+the join modal for `source: "public"`, and the lobby-browser path gets away with
+that because the modal is already open. So the one entry point to the site's
+primary mode took the player's stake and then showed them **the menu** while the
+escrow filled and the server armed its countdown. `DuelPanel` now opens the join
+modal first and joins second; passing `lobbyInfo` is what makes that modal track
+the lobby *without* auto-joining it, leaving the stake gate in
+`Main.resolveWagerJoin` the only thing that admits anyone.
+
+**The footers differ, and only the footer may.** The host can cancel an unfilled
+duel and take the refund; the joiner cannot, and that is a chain fact rather
+than a preference — the joiner is the player who *fills* the lobby, so the
+escrow flips to `InProgress` the moment their stake lands and `cancel_match`
+refuses for 24 hours. A refund button on that screen would offer something that
+cannot happen.
 
 **Three inherited surfaces were removed or hidden, and one lesson generalises.**
 The cosmetics **storefront** is deleted — this deployment sells nothing
