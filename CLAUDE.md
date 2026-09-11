@@ -488,6 +488,11 @@ correctly, then the game failed to boot on both clients, so settlement rightly
 refused an unverifiable replay and the pot waited out the timeout. Every step
 correct, terrible outcome.
 
+**The boot failure itself is now known and fixed** — see "The game worker is a
+blob" below. `[J]` stays on the list regardless: it is the *class* of failure
+that matters, and the next cause of an unstartable match will not announce
+itself either.
+
 **⚠️ Correcting an earlier version of this note:** it said the fix was to withhold
 `start()` until every staked client proved it could run the game, "which keeps the
 escrow `Open`". **That does not work, and the reason is in the program.**
@@ -518,6 +523,63 @@ That leaves two honest directions, and they are different sizes:
 refund racing a slow-but-live settlement. Tracked as `[J]` in the plan.
 
 ---
+
+### ⚠️ The game worker is a blob, so every asset URL it fetches must be absolute
+
+`WorkerClient.ts` instantiates the simulation worker from a same-origin **Blob**
+(Vite's `?worker&inline`), which is what lets the worker bundle be served from a
+CDN at all — `new Worker(crossOriginUrl)` is refused. The cost is that a `blob:`
+URL is **not a hierarchical base**: inside that worker, `fetch("/_assets/...")`
+does not resolve against the site. It throws `TypeError: Failed to parse URL`
+before any request is made.
+
+Upstream never meets this because their production build sets a real `CDN_BASE`,
+and `buildAssetUrl` prefixes manifest hits with it — so their worker's URLs were
+already absolute and the base was never missed. **This deployment serves assets
+same-origin from `static/` (`CDN_BASE=""`), so nothing was making them
+absolute**, and the result was that *no game of any kind could start on the live
+site*: solo, free, or wagered. It is the cause of `EE96ZrfK` and of `Rbp2Lxnd`,
+and the reason a wagered match had never been seen to settle.
+
+`getAssetOrigin()` supplies the missing base. It returns `""` wherever a
+document exists — a page resolves its own root-relative URLs and always did, so
+main-thread URLs are unchanged — and in the worker returns the origin the init
+message handed it, alongside `cdnBase` and for the same reason: what the worker
+knows about where it came from is **told to it, not inferred from a blob URL**.
+
+- **Anything new the worker fetches must go through `assetUrl()`.** A raw
+  root-relative path works everywhere you will test it and nowhere it runs.
+- **Do not "simplify" `getAssetOrigin()` to `self.location.origin`.** It would
+  probably work; the init message is the mechanism already proven for
+  `cdnBase`, and one of them being a guess is how this returns.
+- *Mutation-checked* in `tests/AssetUrls.test.ts`: three cases fail without it.
+  The assertion that matters is `new URL(url)` with **no base**, which is
+  exactly what the worker's fetch must do.
+
+**Nothing in the build catches this class.** tsc, lint and 3229 tests all pass
+on a URL that cannot be fetched from a worker, and the failure needs a real
+browser and a production build to appear at all.
+
+### An unstarted private lobby with nobody in it is closed
+
+`GameServer.phase()` returned `Lobby` unconditionally while `startsAt` was
+unset, so the only thing that ever reaped an abandoned lobby was
+`handleClientDisconnect`'s host-left rule — which needs a close event to arrive
+*and* the leaving client's persistentID to equal the creator's. A tab that dies
+without delivering its close frame gives neither: the client is dropped by the
+60s ping timeout, which runs no such check. The lobby then sat in the browser
+advertising 0 players, holding its creator's one-listing quota, until
+`maxGameDuration` three hours later. Seen live.
+
+Now `phase()` reports `Finished` for a private lobby empty longer than
+`EMPTY_LOBBY_TIMEOUT_MS` (60 s), measured from the last time anyone was
+connected rather than from creation, so a host who reloads reconnects far inside
+it. **Public lobbies are excluded on purpose** — the master generates those
+ahead of the players who fill them and they are *supposed* to sit empty.
+Reporting `Finished` is all it does: `GameManager.tick()` calls `end()`, which
+for a lobby that never started routes to `refundWageredLobby()`, the one refund
+site. No second cancellation path. `tests/server/EmptyLobbyReap.test.ts`,
+mutation-checked.
 
 ## Roadmap
 
@@ -910,6 +972,18 @@ These were established while building the integration and are still live:
   re-derivable from the game id alone — no counter to persist.
 - **`arena/serverKeypair.ts` is the single place the authority key is read.** Do
   not add a second loader.
+- **Which wallet a session belongs to is two facts, and every reader needs
+  both**: the token's `provider === "wallet"` claim (a guest who connected an
+  extension to stake is still a guest) and an address, taken from the connected
+  extension first and then from `walletSession.ts`'s remembered value. Asking
+  the extension alone is wrong in the case that matters most — right after
+  `walletLogin()` reloads the page, `mountWalletProvider()` has run at module
+  scope while Phantom's auto-connect is still in flight, so it answers null.
+  The menu wallet card did exactly that and offered "Connect wallet" to someone
+  who had just connected their wallet; clicking it signed them in again and
+  reloaded to the same screen. The remembered address is a **display cache,
+  never a claim of authentication** — without the provider claim it can only be
+  ignored.
 - **Wallet-signature nonce and message format live in `core/arena/authMessage.ts`**,
   shared by both ends. The prefix used to be declared twice with a "must match
   server" comment — the classic silent-drift setup, whose only symptom is an
