@@ -616,6 +616,41 @@ arrival.
 
 *Mutation-checked* in `tests/server/ArenaWagerStartPresence.test.ts`.
 
+**The same root cause also explains an unpaid win, and it is not a payout bug.**
+Match `92M66WDU…` started 1v0 under the pre-fix code (the opponent's stake had
+confirmed on chain; their own client had not yet connected). The sole connected
+player played it out against bots and won — and the escrow stayed `InProgress`,
+unpaid.
+
+The reason is `verifyReplay()`'s own comment: *"a wagered lobby cannot start
+until the escrow is full, so it always had at least two clients and therefore
+always exchanged hashes — zero comparisons means something is wrong with the
+record."* `handleSynchronization()` skips hash exchange entirely whenever
+`activeClients.length <= 1`. A match that ran its whole life with one human
+present therefore produced **zero** agreed state hashes, and `verifyReplay`
+correctly refused: *"the turn log carries no agreed state hashes, so the replay
+cannot be checked against the game the players saw."* No settlement call was
+ever made. The pot is exactly where it should be — this is the fail-closed
+design working, not failing.
+
+**Why this cannot be "fixed" by paying it out anyway:** doing so would mean
+trusting a solo playthrough against bots as proof of beating a staked opponent,
+which is precisely the trust Phase 4 replaces with a replay. The honest, if
+unsatisfying, outcome is what happens by default: nobody is paid, and the
+24-hour timeout refunds each staker their **own** stake — not the pot — once
+`cancel_match` accepts an `InProgress` match that old.
+
+**Fixed going forward by the same presence check above, not by a second
+change.** A wagered match can no longer start with fewer connected clients than
+staked seats, so every future one has ≥2 active clients from its first tick,
+hash exchange runs normally, and settlement gets exercised for the first time.
+
+*A narrower version of this survives on purpose and is not new work*: a match
+that starts fully attended and then drops to one connected client early — before
+any hash checkpoint has landed — can still refuse for the same reason. That is
+the existing "fail-closed on ambiguity" policy (the hash-mismatch refusal above)
+extended to "zero hashes also refuses," not a gap this change was meant to close.
+
 ## Roadmap
 
 Full plan: `~/.claude/plans/where-are-we-on-staged-snowflake.md` (note: parts of
