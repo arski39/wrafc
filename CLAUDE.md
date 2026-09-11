@@ -904,6 +904,17 @@ that recruits strangers into lobbies that can only ever refund.
   trusting the number.
 - **The card renders the amount as data, outside the translated string**, so a
   missing translation cannot hide what a seat costs.
+- **⚠️ Duel matchmaking does not work while this flag is off, and that coupling
+  is not obvious.** `DuelPanel.openDuelAt()` finds an opponent by looking for an
+  open duel in the **public lobby list**, and a wagered lobby cannot be listed
+  while the gate is closed — so every press of Find creates a lobby no other
+  player can ever discover. On the live site that produced two 1-WARC escrows
+  three minutes apart, neither able to see the other, both waiting on the
+  sweeper. `attachDuelWager()` now **reads the resolved answer and refuses
+  before creating the escrow**: the two halves of the gate are a pair, so the
+  stake would be refused anyway, and the only thing the order decides is
+  whether the player finds out before or after their tokens move.
+  Mutation-checked in `tests/client/ArenaDuelMatchmakingGate.test.ts`.
 - **Joins from the browser route through the same stake gate as a pasted lobby id** —
   `JoinLobbyModal` dispatches `join-lobby` with `source: "private"` for both, which
   is what `Main.resolveWagerJoin` keys on. Worth not breaking.
