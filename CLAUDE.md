@@ -651,6 +651,48 @@ any hash checkpoint has landed — can still refuse for the same reason. That is
 the existing "fail-closed on ambiguity" policy (the hash-mismatch refusal above)
 extended to "zero hashes also refuses," not a gap this change was meant to close.
 
+### ⚠️ A duel's win condition is not upstream's FFA win condition
+
+`WinCheckExecution.checkWinnerFFA()` ends a match when someone owns
+`percentageTilesOwnedToWin()` of the map, or the match timer expires, or the
+170-minute hard limit hits. "Last human standing wins" is a *separate* branch,
+and upstream gates it on `rankedType === RankedType.OneVOne`.
+
+**A wagered duel is not ranked and must not become ranked to get that rule.**
+`rankedType` carries ladder semantics, and on the server it also opts a lobby
+into `cancelShortHandedMatch()`, whose kick reason pushes players back into the
+matchmaking queue — wrong for a lobby somebody staked into by hand, and the
+same trap that made `cancelUnfilledWageredMatch()` use `wager_not_full`
+instead. So the rule now fires for **any two-human FFA**, ranked or not.
+
+Before that, killing your opponent did not end a duel. Live on `ihMXJTQm`: one
+player ate the other ~70 s in, the match kept running against the bots, both
+players left, and the replay faithfully reproduced a game with **no winner** —
+so `settle_match` had nobody to pay and 2 WARC waited out the 24 h refund. The
+replay was correct; the win condition was wrong. The match timer would
+eventually have produced a winner, which is worse than it sounds: the pot would
+have gone to whoever farmed the most bots for the remaining ten minutes, not to
+whoever won the duel.
+
+- **The count comes from the roster, not `gameConfig.maxPlayers`.** Same fact,
+  but `maxPlayers` arrives over a config push that a server-side auto-start once
+  skipped entirely (see `[K]`), while the roster is in `GameStartInfo` and so is
+  identical in a replay and cannot go missing.
+- **`allPlayers()`, not `players()`** — a constant property of the match, not
+  something that becomes true once a 16-player FFA is down to its last two.
+- **Fixing it in `core/` is what makes it count.** Settlement pays
+  `verdict.winner` from the server's own re-simulation, so a rule that lived
+  anywhere else would leave the replay disagreeing with the players.
+- `tests/ArenaDuelWinCondition.test.ts`, mutation-checked, and it pins the
+  ranked path separately so that keeps working on its own terms.
+
+**Unrelated, seen in the same logs and still open:** `error archiving game
+record: Request Entity Too Large`. The ordinary game-record archive POST is
+rejected for payload size, so a finished match cannot be replayed or spectated
+afterwards. It does not touch settlement — `settleVerified()` runs off the
+in-memory turn log before `archive()` is called — but it means the record of a
+wagered match is not kept anywhere.
+
 ## Roadmap
 
 Full plan: `~/.claude/plans/where-are-we-on-staged-snowflake.md` (note: parts of
