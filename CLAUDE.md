@@ -779,6 +779,31 @@ by default, which is the safe direction. Both players stake the same amount, so
 the map is part of what they paid for; letting whoever clicked first choose it
 is an edge bought with nothing.
 
+### A wagered match ends on the pot, and the stake gets there by being written down
+
+`GameStartInfo` carries **no escrow**, deliberately — nothing in the simulation
+may depend on one, so by the time the win modal runs the lobby is gone and
+nothing in the browser knows the match was wagered. `client/arena/wagerSession.ts`
+records it at the one place that does: the gate that took the payment. Keyed by
+**game id in sessionStorage**, because a reconnecting player reloads mid-match
+and would otherwise be shown the free-play screen after winning real tokens —
+and because keying on the id is what stops the *next* match inheriting this
+one's pot. It is a **display cache, never authoritative**: the payout is decided
+by `settle_match` against the server's replay, so a tampered entry can only
+mislead the person who tampered with it.
+
+- **The winner's line says the payout is being made, not that it has.**
+  Settlement runs after the match and fails closed; claiming the tokens had
+  landed is a promise this screen cannot keep.
+- **The amount comes from `winnerPayout()`**, the same implementation the stake
+  prompt quoted, and renders **as data outside the translated string** — same
+  rule as the lobby card.
+- Upstream's `win_modal.support_openfront` promo is **gone**, not merely
+  outranked: `/cosmetics.json` is empty here, so it could only ever render an
+  empty box advertising upstream by name from a fork. `tests/client/
+  ArenaWagerEndScreen.test.ts` pins its absence for free games too, and is
+  mutation-checked.
+
 ### Both players of a duel see the same waiting room
 
 `arena/duelWaitingRoom.ts` renders the pot and the two seats; each side supplies
